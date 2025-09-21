@@ -210,7 +210,8 @@ def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20), 
     num_signals, signal_length = chunk.shape  # Anzahl der Signale und Länge der Zeitreihe
     augmented_chunk = np.zeros_like(chunk, dtype=np.float32)  # Speicher für augmentierte Daten
 
-    for i in tqdm(range(num_signals), desc="Augmenting Audio", unit="signals"):
+    # for i in tqdm(range(num_signals), desc="Augmenting Audio", unit="signals"):
+    for i in range(num_signals):  # tqdm im Notebook optional halten
         sig = chunk[i]
         # 1) optionaler Noise-Mix (macht RAR realistischer)
         if noise_pool and random.random() < p_noise:

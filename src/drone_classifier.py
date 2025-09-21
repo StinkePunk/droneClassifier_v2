@@ -122,21 +122,26 @@ class DroneClassifier:
         print(X_val.shape)  # Erwartet (N,128,128); predict hebt auf (N,128,128,1)
         y_pred_prob = self.predict(X_val).ravel()
         # Threshold-Suche: F1(drone=1) maximieren
-        from sklearn.metrics import f1_score, classification_report, confusion_matrix
+        from sklearn.metrics import f1_score, classification_report, confusion_matrix, accuracy_score
         ts = np.linspace(0.05, 0.95, 19)
-        scores = []
+        best_t, best_macro = 0.5, -1.0
         for t in ts:
             y_hat = (y_pred_prob >= t).astype(int)
-            scores.append((f1_score(y_val, y_hat, pos_label=1), t))
-        best_f1, best_t = max(scores, key=lambda z: z[0])
+            f1_pos = f1_score(y_val, y_hat, pos_label=1)
+            f1_neg = f1_score(1 - y_val, 1 - y_hat, pos_label=1)  # F1 für no-drone
+            macro = 0.5 * (f1_pos + f1_neg)
+            if macro > best_macro:
+                best_macro, best_t = macro, t
         y_pred = (y_pred_prob >= best_t).astype(int)
-        print(f"Best threshold (drone=pos): {best_t:.3f} | F1(drone): {best_f1:.3f}")
+        acc = accuracy_score(y_val, y_pred)
+        print(f"Best threshold (macro-F1): {best_t:.3f} | macro-F1: {best_macro:.3f} | acc: {acc:.3f}")
 
         # Confusion Matrix
         cm = confusion_matrix(y_val, y_pred, labels=[0,1])
         plot_confusion_matrix(cm)
         plot_probability_distribution(y_pred_prob)
         print(classification_report(y_val, y_pred, target_names=['no drone (0)','drone (1)'], digits=3))
+        return acc
 
 class TrainerPipeline:
     """
@@ -178,8 +183,8 @@ class TrainerPipeline:
             X_val, y_val     = val_data.chunk_and_label()
 
             # Augmentiere nur das Train-Set:
-            # realistische Noise-Mischung aus echten "no drone"-Chunks der Validierung
-            noise_pool = [x for x, lbl in zip(X_val, y_val) if str(lbl).lower() in ("no drone","no_drone","no-drone","0","nd")]
+            # Noise-Mischung NUR aus "no drone"-Chunks des TRAINING-SETS (keine Val-Daten in Training!)
+            noise_pool = [x for x, lbl in zip(X_train, y_train) if str(lbl).lower() in ("no drone","no_drone","no-drone","0","nd")]
             X_train = apply_augmentations(
                 X_train, self.config['sample_rate'],
                 noise_pool=noise_pool, snr_range=(0,20), p_noise=0.9

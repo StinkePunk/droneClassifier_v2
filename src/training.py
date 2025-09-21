@@ -145,7 +145,7 @@ def train_classifier(train_features, y_train, val_features, y_val,
     # Kompilieren des Modells
     model.compile(
         optimizer=optimizer,
-        loss=tf.keras.losses.BinaryCrossentropy(),
+        loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=0.02),
         metrics=[
             tf.keras.metrics.AUC(name="auc"),
             tf.keras.metrics.AUC(curve="PR", name="auprc"),

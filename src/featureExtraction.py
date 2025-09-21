@@ -24,6 +24,7 @@ def extract_features(audio_files, max_length=128, message="Processing features",
             y=audio, sr=sr, n_mels=n_mels, fmax=fmax, hop_length=hop_length
         )
         feature = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        feature = np.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0)
 
         # SpecAugment (nur im Training): kleine Time/Freq-Masks
         if is_training:
