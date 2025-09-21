@@ -51,9 +51,9 @@ class FeatureExtractor:
         self.max_length = max_length
         self.fmax = fmax or sample_rate // 2
 
-    def extract(self, audio_data):
+    def extract(self, audio_data, is_training=False):
         """Extract Mel-spectrogram features from a list of audio arrays."""
-        return extract_features(audio_data, self.max_length, sr=self.sample_rate, fmax=self.fmax)
+        return extract_features(audio_data, self.max_length, sr=self.sample_rate, fmax=self.fmax, is_training=is_training)
 
 
 class DroneClassifier:
@@ -75,15 +75,10 @@ class DroneClassifier:
 
     def train(self, X_train, y_train, X_val, y_val):
         """Train the classifier and save it to disk."""
-        # Einheitliches Label-Mapping über beide Splits
-        self.label_encoder = LabelEncoder()
-        all_y = np.concatenate([y_train, y_val])
-        self.label_encoder.fit(all_y)
-        y_train_enc = self.label_encoder.transform(y_train)
-        y_val_enc   = self.label_encoder.transform(y_val)
-        print("Label mapping:", dict(zip(self.label_encoder.classes_,
-                                         self.label_encoder.transform(self.label_encoder.classes_))))
-
+        # Einheitliches Binär-Mapping: drone=1, no drone=0
+        y_train_enc = (np.asarray(y_train, dtype=str) == 'drone').astype('int32')
+        y_val_enc   = (np.asarray(y_val,   dtype=str) == 'drone').astype('int32')
+        print("Label mapping (fixed): {'no drone': 0, 'drone': 1}")
         self.model, self.history, self.scaler = train_classifier(
             X_train, y_train_enc, X_val, y_val_enc,
             model_name="MobileNet",
@@ -121,29 +116,27 @@ class DroneClassifier:
         Shows confusion matrix and prediction probability distribution.
         """
         # Einheitliche Label-Kodierung
-        if hasattr(self, "label_encoder") and isinstance(y_val[0], str):
-            y_val = self.label_encoder.transform(y_val)
+        if isinstance(y_val[0], str):
+            y_val = (np.asarray(y_val, dtype=str) == 'drone').astype('int32')
 
         print(X_val.shape)  # Erwartet (N,128,128); predict hebt auf (N,128,128,1)
         y_pred_prob = self.predict(X_val).ravel()
-        # datengetriebener Threshold (max F1 für Klasse "no drone"==1)
-        import numpy as np
-        best_t, best_f1 = 0.5, -1.0
-        for t in np.linspace(0.1, 0.9, 33):
-            pred = (y_pred_prob >= t).astype(int)
-            tp = np.sum((pred==1)&(y_val==1)); fp = np.sum((pred==1)&(y_val==0))
-            fn = np.sum((pred==0)&(y_val==1))
-            f1 = 2*tp/(2*tp+fp+fn+1e-9)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
+        # Threshold-Suche: F1(drone=1) maximieren
+        from sklearn.metrics import f1_score, classification_report, confusion_matrix
+        ts = np.linspace(0.05, 0.95, 19)
+        scores = []
+        for t in ts:
+            y_hat = (y_pred_prob >= t).astype(int)
+            scores.append((f1_score(y_val, y_hat, pos_label=1), t))
+        best_f1, best_t = max(scores, key=lambda z: z[0])
         y_pred = (y_pred_prob >= best_t).astype(int)
-        print(f"Best threshold: {best_t:.3f} | F1(no-drone): {best_f1:.3f}")
+        print(f"Best threshold (drone=pos): {best_t:.3f} | F1(drone): {best_f1:.3f}")
 
         # Confusion Matrix
-        cm = confusion_matrix(y_val, y_pred)
+        cm = confusion_matrix(y_val, y_pred, labels=[0,1])
         plot_confusion_matrix(cm)
         plot_probability_distribution(y_pred_prob)
-
+        print(classification_report(y_val, y_pred, target_names=['no drone (0)','drone (1)'], digits=3))
 
 class TrainerPipeline:
     """
@@ -182,13 +175,19 @@ class TrainerPipeline:
             val_data = AudioDataset(self.config['val_path'], self.config['sample_rate'], self.chunk_length)
             
             X_train, y_train = train_data.chunk_and_label()
-            X_val, y_val = val_data.chunk_and_label()
+            X_val, y_val     = val_data.chunk_and_label()
 
-            # Augmentiere nur das train-Set
-            X_train = apply_augmentations(X_train, self.config['sample_rate'])
+            # Augmentiere nur das Train-Set:
+            # realistische Noise-Mischung aus echten "no drone"-Chunks der Validierung
+            noise_pool = [x for x, lbl in zip(X_val, y_val) if str(lbl).lower() in ("no drone","no_drone","no-drone","0","nd")]
+            X_train = apply_augmentations(
+                X_train, self.config['sample_rate'],
+                noise_pool=noise_pool, snr_range=(0,20), p_noise=0.9
+            )
 
-            train_features = self.extractor.extract(X_train)
-            val_features = self.extractor.extract(X_val)
+            # SpecAugment nur im Training aktiv
+            train_features = self.extractor.extract(X_train, is_training=True)
+            val_features   = self.extractor.extract(X_val)
 
             with open(self.config['feature_files']['train_features'], "wb") as f:
                 pickle.dump(train_features, f)

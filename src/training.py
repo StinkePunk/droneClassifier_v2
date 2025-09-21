@@ -121,16 +121,12 @@ def train_classifier(train_features, y_train, val_features, y_val,
 
     # Da es wesentlich mehr "Drone" als "No drone" Daten gibt:
     
-    # Berechnung der Klassengewichte
-    class_weights = compute_class_weight(
-        class_weight='balanced',
-        classes=np.unique(y_train),
-        y=y_train
-    )
-
-    # Umwandeln in ein Dictionary
-    class_weight_dict = {i: weight for i, weight in enumerate(class_weights)}
-    print("Class weights:", class_weight_dict)
+    # Balanced: w_c = N / (K * n_c)
+    classes, counts = np.unique(y_train, return_counts=True)
+    N = len(y_train); K = len(classes)
+    class_weight_dict = {int(c): float(N/(K*cnt)) for c, cnt in zip(classes, counts)}
+    print(f"Class counts: {dict(zip(classes.tolist(), counts.tolist()))}")
+    print(f"Class weights (balanced): {class_weight_dict}")
     
     # Fixe Klassengweichte
     # class_weight_dict = {0: 0.8, 1: 0.2}
@@ -176,13 +172,14 @@ def train_classifier(train_features, y_train, val_features, y_val,
 
 
     # Modell trainieren
-    history = model.fit(train_features, y_train, 
-                        epochs=30, 
-                        batch_size=batchSize,
-                        validation_data=(val_features, y_val),
-                        class_weight=class_weight_dict,
-                        callbacks=[reduce_lr, early_stopping], # Early Stopping aktivieren
-                        verbose = 5
+    history = model.fit(
+        train_features, y_train, 
+        epochs=30,
+        batch_size=batchSize,
+        validation_data=(val_features, y_val),
+        class_weight=class_weight_dict,
+        callbacks=[reduce_lr, early_stopping], # Early Stopping aktivieren
+        verbose = 2
     )
 
     return model, history, scaler
