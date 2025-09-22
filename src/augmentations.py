@@ -2,6 +2,7 @@ import numpy as np
 import random
 from scipy import signal
 import glob, os
+import librosa
 from tqdm import tqdm  # Fortschrittsbalken-Bibliothek
 import time
 
@@ -193,7 +194,8 @@ def _mix_noise(signal, noise, snr_db):
     return y / (np.max(np.abs(y)) + 1e-9)
 
 
-def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20), p_noise=0.9):
+def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20),
+                        p_noise=0.9, rir_list=None, rir_skip_prob=0.2):
     """
     Wendet nur das Hinzufügen von Echos auf die Audiodaten an.
     Augmentiert Chunks: optional Noise-Mix (real-world), immer leichtes Echo.
@@ -213,7 +215,15 @@ def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20), 
     # for i in tqdm(range(num_signals), desc="Augmenting Audio", unit="signals"):
     for i in range(num_signals):  # tqdm im Notebook optional halten
         sig = chunk[i]
-        # 1) optionaler Noise-Mix (macht RAR realistischer)
+        # 0) RIR-Faltung (vor Noise): wähle genau eine RIR oder None
+        # None-Quote = rir_skip_prob (Standard 0.2 ⇒ ~jeder 5. Chunk ohne RIR)
+        if rir_list:
+            choice_pool = [None] + list(rir_list)
+            weights = [rir_skip_prob] + [(1.0 - rir_skip_prob) / max(len(rir_list), 1)] * len(rir_list)
+            rir = random.choices(choice_pool, weights=weights, k=1)[0]
+            if rir is not None:
+                sig = apply_rir(sig, rir)
+        # 1) Noise-Mix (macht RAR realistischer)
         if noise_pool and random.random() < p_noise:
             noise = random.choice(noise_pool)
             snr = random.uniform(*snr_range)
@@ -224,16 +234,27 @@ def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20), 
         augmented_chunk[i] = add_echo(sig, sample_rate, delay_ms, echo_amplitude)
     return augmented_chunk if np.any(augmented_chunk) else chunk
 
-def _load_rirs(rir_dir):
+def load_rirs(rir_dir, sample_rate):
+    """Lädt *.wav-RIRs, resampelt auf sample_rate und normiert Energie (L2)."""
     paths = glob.glob(os.path.join(rir_dir, "*.wav"))
-    return [librosa.load(p, sr=None)[0] for p in paths] if paths else []
+    rirs = []
+    for p in paths:
+        rir, sr = librosa.load(p, sr=None, mono=True)
+        if sr != sample_rate:
+            rir = librosa.resample(rir, orig_sr=sr, target_sr=sample_rate)
+        # Energie-Normierung vermeidet Pegelverschiebungen nach Faltung
+        rir = rir.astype(np.float32)
+        rir = rir / (np.sqrt(np.sum(rir**2)) + 1e-9)
+        rirs.append(rir)
+    return rirs
 
 def apply_rir(x, rir):
+    """Faltet x mit normierter RIR und trimmt auf Originallänge."""
     if rir is None or len(rir) == 0:
         return x
     y = signal.fftconvolve(x, rir, mode="full")[: len(x)]
-    m = np.max(np.abs(y)) + 1e-9
-    return (y / m).astype(x.dtype)
+    y = y / (np.max(np.abs(y)) + 1e-9)
+    return y.astype(x.dtype)
 
 def mix_noise(x, noise, snr_db):
     if noise is None or len(noise) == 0:
@@ -262,11 +283,11 @@ class RealWorldAug:
     def __call__(self, chunk, sr):
         y = chunk.copy()
         # 1) RIR-Faltung (mit p=0.7)
-        if self.rirs and random() < 0.7:
+        if self.rirs and random.random() < 0.7:
             rir = np.random.choice(self.rirs)
             y = apply_rir(y, rir)
         # 2) Noisemix (mit p=0.9)
-        if self.noises and random() < 0.9:
+        if self.noises and random.random() < 0.9:
             noise = np.random.choice(self.noises)
             snr = np.random.uniform(*self.snr_range)  # 0–20 dB
             y = mix_noise(y, noise, snr_db=snr)

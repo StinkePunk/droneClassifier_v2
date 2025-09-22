@@ -3,7 +3,7 @@ import pickle
 import numpy as np
 from loadDataStore import load_audio_data
 from splitAudioFiles import split_data_and_labels
-from augmentations import apply_augmentations
+from augmentations import apply_augmentations, load_rirs
 from featureExtraction import extract_features
 from tensorflow.keras.models import load_model
 from training import train_classifier
@@ -185,9 +185,14 @@ class TrainerPipeline:
             # Augmentiere nur das Train-Set:
             # Noise-Mischung NUR aus "no drone"-Chunks des TRAINING-SETS (keine Val-Daten in Training!)
             noise_pool = [x for x, lbl in zip(X_train, y_train) if str(lbl).lower() in ("no drone","no_drone","no-drone","0","nd")]
+            # Optional: RIRs laden (wenn konfiguriert)
+            rir_list = []
+            if 'rir_dir' in self.config and self.config['rir_dir']:
+                rir_list = load_rirs(self.config['rir_dir'], self.config['sample_rate'])
             X_train = apply_augmentations(
                 X_train, self.config['sample_rate'],
-                noise_pool=noise_pool, snr_range=(0,20), p_noise=0.9
+                noise_pool=noise_pool, snr_range=(0,20), p_noise=0.9,
+                rir_list=rir_list, rir_skip_prob=0.2
             )
 
             # SpecAugment nur im Training aktiv
