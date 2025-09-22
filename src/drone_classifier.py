@@ -51,9 +51,12 @@ class FeatureExtractor:
         self.max_length = max_length
         self.fmax = fmax or sample_rate // 2
 
-    def extract(self, audio_data, is_training=False):
+    def extract(self, audio_data, is_training=False, apply_pre_emphasis=True, pre_emph_alpha=0.97):
         """Extract Mel-spectrogram features from a list of audio arrays."""
-        return extract_features(audio_data, self.max_length, sr=self.sample_rate, fmax=self.fmax, is_training=is_training)
+        return extract_features(
+            audio_data, self.max_length, sr=self.sample_rate, fmax=self.fmax,
+            is_training=is_training, apply_pre_emphasis=apply_pre_emphasis, pre_emph_alpha=pre_emph_alpha
+        )
 
 
 class DroneClassifier:
@@ -109,7 +112,7 @@ class DroneClassifier:
         Xp = self._prepare_inputs(X)
         return self.model.predict(Xp, verbose=0)
 
-    def evaluate(self, X_val, y_val):
+    def evaluate(self, X_val, y_val, min_precision_drone: float = 0.85, threshold_strategy: str = "macro_f1"):
         """
         Evaluate the model on validation data.
 
@@ -121,23 +124,34 @@ class DroneClassifier:
 
         print(X_val.shape)  # Erwartet (N,128,128); predict hebt auf (N,128,128,1)
         y_pred_prob = self.predict(X_val).ravel()
-        # Threshold-Suche: F1(drone=1) maximieren
-        from sklearn.metrics import f1_score, classification_report, confusion_matrix, accuracy_score
-        ts = np.linspace(0.05, 0.95, 19)
-        best_t, best_macro = 0.5, -1.0
-        for t in ts:
-            y_hat = (y_pred_prob >= t).astype(int)
-            f1_pos = f1_score(y_val, y_hat, pos_label=1)
-            f1_neg = f1_score(1 - y_val, 1 - y_hat, pos_label=1)  # F1 für no-drone
-            macro = 0.5 * (f1_pos + f1_neg)
-            if macro > best_macro:
-                best_macro, best_t = macro, t
+
+        # Schwellenwahl
+        from sklearn.metrics import precision_recall_curve, classification_report, confusion_matrix, accuracy_score, f1_score, roc_curve
+        if threshold_strategy == "recall_at_precision":
+            prec, rec, thr = precision_recall_curve(y_val, y_pred_prob)
+            mask = prec[:-1] >= min_precision_drone
+            best_t = thr[mask][np.argmax(rec[:-1][mask])] if np.any(mask) else 0.5
+        elif threshold_strategy == "youden":
+            fpr, tpr, thr = roc_curve(y_val, y_pred_prob)
+            best_t = thr[np.argmax(tpr - fpr)]
+        else:  # "macro_f1"
+            ts = np.linspace(0.05, 0.95, 19)
+            best_t, best_macro = 0.5, -1.0
+            for t in ts:
+                y_hat = (y_pred_prob >= t).astype(int)
+                f1_pos = f1_score(y_val, y_hat, pos_label=1)
+                f1_neg = f1_score(1 - y_val, 1 - y_hat, pos_label=1)
+                macro = 0.5 * (f1_pos + f1_neg)
+                if macro > best_macro:
+                    best_macro, best_t = macro, t
+
         y_pred = (y_pred_prob >= best_t).astype(int)
         acc = accuracy_score(y_val, y_pred)
-        print(f"Best threshold (macro-F1): {best_t:.3f} | macro-F1: {best_macro:.3f} | acc: {acc:.3f}")
+        pos_rate = float(y_pred.mean())
+        print(f"Threshold={best_t:.3f} | acc={acc:.3f} | pos_rate={pos_rate:.3f}")
 
         # Confusion Matrix
-        cm = confusion_matrix(y_val, y_pred, labels=[0,1])
+        cm = confusion_matrix(y_val, y_pred, labels=[1,0])
         plot_confusion_matrix(cm)
         plot_probability_distribution(y_pred_prob)
         print(classification_report(y_val, y_pred, target_names=['no drone (0)','drone (1)'], digits=3))
@@ -184,20 +198,38 @@ class TrainerPipeline:
 
             # Augmentiere nur das Train-Set:
             # Noise-Mischung NUR aus "no drone"-Chunks des TRAINING-SETS (keine Val-Daten in Training!)
-            noise_pool = [x for x, lbl in zip(X_train, y_train) if str(lbl).lower() in ("no drone","no_drone","no-drone","0","nd")]
+            def _norm(lbl:str) -> str:
+                return str(lbl).strip().lower().replace("-", " ").replace("_", " ")
+            noise_pool = [x for x, lbl in zip(X_train, y_train) if "no drone" in _norm(lbl) or _norm(lbl) == "0"]
             # Optional: RIRs laden (wenn konfiguriert)
             rir_list = []
-            if 'rir_dir' in self.config and self.config['rir_dir']:
-                rir_list = load_rirs(self.config['rir_dir'], self.config['sample_rate'])
-            X_train = apply_augmentations(
-                X_train, self.config['sample_rate'],
-                noise_pool=noise_pool, snr_range=(0,20), p_noise=0.9,
-                rir_list=rir_list, rir_skip_prob=0.2
-            )
+            rir_dir = self.config.get('rir_dir')
+            if rir_dir:
+                rir_list = load_rirs(
+                    rir_dir,
+                    self.config['sample_rate'],
+                    trim_ms=self.config.get('rir_trim_ms', None)
+                )
+            # >>> Nur DRONE-Chunks augmentieren <<<
+            drone_idx = [i for i, lbl in enumerate(y_train) if "drone" == _norm(lbl)]
+            if drone_idx:
+                X_drone = [X_train[i] for i in drone_idx]
+                X_drone_aug = apply_augmentations(
+                     X_drone, self.config['sample_rate'],
+                     noise_pool=noise_pool, snr_range=(8,20), p_noise=0.9,
+                    rir_list=rir_list, rir_skip_prob=0.5
+                 )
+                # Zurückschreiben, No-Drone bleibt unverändert
+                X_train = list(X_train)
+                for j, idx in enumerate(drone_idx):
+                    X_train[idx] = X_drone_aug[j]
+            # <<< Ende nur-Drone-Augmentierung
 
-            # SpecAugment nur im Training aktiv
-            train_features = self.extractor.extract(X_train, is_training=True)
-            val_features   = self.extractor.extract(X_val)
+             # konsistent: Pre-Emphasis in Features, für Train & Val gleich
+            pe = self.config.get("apply_pre_emphasis", True)
+            alpha = self.config.get("pre_emph_alpha", 0.97)
+            train_features = self.extractor.extract(X_train, is_training=True,  apply_pre_emphasis=pe, pre_emph_alpha=alpha)
+            val_features   = self.extractor.extract(X_val,   is_training=False, apply_pre_emphasis=pe, pre_emph_alpha=alpha)
 
             with open(self.config['feature_files']['train_features'], "wb") as f:
                 pickle.dump(train_features, f)

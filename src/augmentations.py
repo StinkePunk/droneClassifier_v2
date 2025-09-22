@@ -195,7 +195,7 @@ def _mix_noise(signal, noise, snr_db):
 
 
 def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20),
-                        p_noise=0.9, rir_list=None, rir_skip_prob=0.2):
+                        p_noise=0.9, rir_list=None, rir_skip_prob=0.5, p_echo=0.3):
     """
     Wendet nur das Hinzufügen von Echos auf die Audiodaten an.
     Augmentiert Chunks: optional Noise-Mix (real-world), immer leichtes Echo.
@@ -215,8 +215,8 @@ def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20),
     # for i in tqdm(range(num_signals), desc="Augmenting Audio", unit="signals"):
     for i in range(num_signals):  # tqdm im Notebook optional halten
         sig = chunk[i]
-        # 0) RIR-Faltung (vor Noise): wähle genau eine RIR oder None
-        # None-Quote = rir_skip_prob (Standard 0.2 ⇒ ~jeder 5. Chunk ohne RIR)
+        # 0) RIR-Faltung (vor Noise): mit Wahrscheinlichkeit (1 - rir_skip_prob)
+        # wird eine zufällige RIR gewählt; sonst keine RIR
         if rir_list:
             choice_pool = [None] + list(rir_list)
             weights = [rir_skip_prob] + [(1.0 - rir_skip_prob) / max(len(rir_list), 1)] * len(rir_list)
@@ -228,13 +228,15 @@ def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20),
             noise = random.choice(noise_pool)
             snr = random.uniform(*snr_range)
             sig = _mix_noise(sig, noise, snr_db=snr)
-        # 2) mildes Echo (Reflexionsanmutung)
-        delay_ms = random.randint(5, 30)
-        echo_amplitude = random.uniform(0.02, 0.2)
-        augmented_chunk[i] = add_echo(sig, sample_rate, delay_ms, echo_amplitude)
+        # 2) Echo nur optional
+        if random.random() < p_echo:
+            delay_ms = random.randint(5, 20)
+            echo_amplitude = random.uniform(0.02, 0.08)
+            sig = add_echo(sig, sample_rate, delay_ms, echo_amplitude)
+        augmented_chunk[i] = sig
     return augmented_chunk if np.any(augmented_chunk) else chunk
 
-def load_rirs(rir_dir, sample_rate):
+def load_rirs(rir_dir, sample_rate, trim_ms=None):
     """Lädt *.wav-RIRs, resampelt auf sample_rate und normiert Energie (L2)."""
     paths = glob.glob(os.path.join(rir_dir, "*.wav"))
     rirs = []
@@ -242,6 +244,14 @@ def load_rirs(rir_dir, sample_rate):
         rir, sr = librosa.load(p, sr=None, mono=True)
         if sr != sample_rate:
             rir = librosa.resample(rir, orig_sr=sr, target_sr=sample_rate)
+        # optional für Outdoor-Charakter die RIR kürzen
+        if trim_ms is not None and trim_ms > 0:
+            n = int(sample_rate * (trim_ms / 1000.0))
+            rir = rir[:n]
+            # 5 ms Fade-Out gegen harte Kante
+            fade = int(0.005 * sample_rate)
+            if len(rir) > fade:
+                rir[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=rir.dtype)
         # Energie-Normierung vermeidet Pegelverschiebungen nach Faltung
         rir = rir.astype(np.float32)
         rir = rir / (np.sqrt(np.sum(rir**2)) + 1e-9)

@@ -124,9 +124,12 @@ def train_classifier(train_features, y_train, val_features, y_val,
     # Balanced: w_c = N / (K * n_c)
     classes, counts = np.unique(y_train, return_counts=True)
     N = len(y_train); K = len(classes)
-    class_weight_dict = {int(c): float(N/(K*cnt)) for c, cnt in zip(classes, counts)}
+    weights = {int(c): float(N/(K*cnt)) for c, cnt in zip(classes, counts)}  # balanced
+    pos_boost = 1.3  # Drone (=1) etwas stärker gewichten für höheren Recall
+    weights[1] = weights.get(1, 1.0) * pos_boost
+    class_weight_dict = weights
     print(f"Class counts: {dict(zip(classes.tolist(), counts.tolist()))}")
-    print(f"Class weights (balanced): {class_weight_dict}")
+    print(f"Class weights (balanced+pos_boost={pos_boost}): {class_weight_dict}")
     
     # Fixe Klassengweichte
     # class_weight_dict = {0: 0.8, 1: 0.2}
@@ -145,7 +148,7 @@ def train_classifier(train_features, y_train, val_features, y_val,
     # Kompilieren des Modells
     model.compile(
         optimizer=optimizer,
-        loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=0.02),
+        loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=0.01),
         metrics=[
             tf.keras.metrics.AUC(name="auc"),
             tf.keras.metrics.AUC(curve="PR", name="auprc"),
