@@ -75,6 +75,7 @@ class DroneClassifier:
         self.history = None
         self.scaler = None
         self.scaler_path = scaler_path or (os.path.splitext(model_path)[0] + "_scaler.pkl")
+        self.temperature = 1.0  # für Probabilitäts-Kalibrierung
 
     def train(self, X_train, y_train, X_val, y_val):
         """Train the classifier and save it to disk."""
@@ -91,6 +92,23 @@ class DroneClassifier:
         self.model.save(self.model_path)
         # Kein externer Scaler mehr notwendig
         self.scaler = None
+        # Nach Training: Temperatur auf Val-Daten kalibrieren
+        yv = (np.asarray(y_val, dtype=str) == 'drone').astype('int32') if isinstance(y_val[0], str) else np.asarray(y_val, dtype='int32')
+        self._calibrate_temperature(X_val, yv)
+
+    def _calibrate_temperature(self, X_val, y_val):
+        """Grid-Search über T zur Minimierung der NLL."""
+        p = self.model.predict(self._prepare_inputs(X_val), verbose=0).ravel()
+        p = np.clip(p, 1e-6, 1-1e-6)
+        logit = np.log(p) - np.log(1-p)
+        Ts = np.linspace(0.8, 3.0, 23)
+        def nll(T):
+            z = logit / T
+            q = 1/(1+np.exp(-z))
+            q = np.clip(q, 1e-6, 1-1e-6)
+            return -np.mean(y_val*np.log(q) + (1-y_val)*np.log(1-q))
+        self.temperature = float(Ts[int(np.argmin([nll(T) for T in Ts]))])
+        print(f"[Calib] Temperature T={self.temperature:.2f}")
 
     def load(self):
         """Load a pre-trained model from disk."""
@@ -110,7 +128,12 @@ class DroneClassifier:
     def predict(self, X):
         """Predict probabilities for given feature inputs."""
         Xp = self._prepare_inputs(X)
-        return self.model.predict(Xp, verbose=0)
+        p = self.model.predict(self._prepare_inputs(X), verbose=0).ravel()
+        if getattr(self, "temperature", 1.0) != 1.0:
+            p = np.clip(p, 1e-6, 1-1e-6)
+            z = np.log(p) - np.log(1-p)
+            p = 1/(1+np.exp(-z/self.temperature))
+        return p
 
     def evaluate(self, X_val, y_val, min_precision_drone: float = 0.85, threshold_strategy: str = "macro_f1"):
         """
@@ -126,7 +149,7 @@ class DroneClassifier:
         y_pred_prob = self.predict(X_val).ravel()
 
         # Schwellenwahl
-        from sklearn.metrics import precision_recall_curve, classification_report, confusion_matrix, accuracy_score, f1_score, roc_curve
+        from sklearn.metrics import precision_recall_curve, classification_report, confusion_matrix, accuracy_score, f1_score, roc_curve, brier_score_loss
         if threshold_strategy == "recall_at_precision":
             prec, rec, thr = precision_recall_curve(y_val, y_pred_prob)
             mask = prec[:-1] >= min_precision_drone
@@ -148,7 +171,18 @@ class DroneClassifier:
         y_pred = (y_pred_prob >= best_t).astype(int)
         acc = accuracy_score(y_val, y_pred)
         pos_rate = float(y_pred.mean())
-        print(f"Threshold={best_t:.3f} | acc={acc:.3f} | pos_rate={pos_rate:.3f}")
+        # Kalibrierungsmetriken
+        brier = brier_score_loss(y_val, y_pred_prob)
+        # sehr einfache ECE (10-Bins)
+        bins = np.linspace(0,1,11); idx = np.digitize(y_pred_prob, bins)-1
+        ece = 0.0
+        for b in range(10):
+            m = idx==b
+            if np.any(m):
+                conf = y_pred_prob[m].mean()
+                acc_b = (y_val[m]==(y_pred_prob[m]>=best_t)).mean()
+                ece += np.abs(acc_b - conf) * (m.mean())
+        print(f"Threshold={best_t:.3f} | acc={acc:.3f} | pos_rate={pos_rate:.3f} | Brier={brier:.4f} | ECE@10={ece:.4f} | T={getattr(self,'temperature',1.0):.2f}")
 
         # Confusion Matrix
         cm = confusion_matrix(y_val, y_pred, labels=[1,0])
