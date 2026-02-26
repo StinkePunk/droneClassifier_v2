@@ -1,9 +1,11 @@
 import librosa
 import numpy as np
 import sys
+from scipy.signal import lfilter
 
 def extract_features(audio_files, max_length=128, message="Processing features",
-                     sr=16000, n_mels=128, fmax=8000, is_training=False):
+                     sr=16000, n_mels=128, fmax=8000, is_training=False, show_progress=False,
+                     apply_pre_emphasis=True, pre_emph_alpha=0.97):
     features = []
     hop_length = int(sr / max_length)
 
@@ -20,8 +22,12 @@ def extract_features(audio_files, max_length=128, message="Processing features",
         sys.stdout.write(f"\r{progress_bar}")
         sys.stdout.flush()
 
+        # optional Pre-Emphasis
+        sig = audio.astype(np.float32)
+        if apply_pre_emphasis:
+            sig = lfilter([1.0, -pre_emph_alpha], [1.0], sig)
         mel_spectrogram = librosa.feature.melspectrogram(
-            y=audio, sr=sr, n_mels=n_mels, fmax=fmax, hop_length=hop_length
+            y=sig, sr=sr, n_mels=n_mels, fmax=fmax, hop_length=hop_length
         )
         feature = librosa.power_to_db(mel_spectrogram, ref=np.max)
         feature = np.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0)

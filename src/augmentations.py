@@ -159,25 +159,6 @@ def apply_noise_augmentation(drone_dataset, noise_dataset, sample_rate, max_snr_
     return AudioDataSet(augmented)
 
 
-def add_echo(chunk, sample_rate, delay_ms=20, echo_amplitude=0.1):
-    """
-    Fügt den Audiodaten ein Echo hinzu.
-
-    Parameter:
-    - chunk: Eingabedaten (z. B. 1D-Array für eine Audiodatei).
-    - sample_rate: Abtastrate der Audiodaten (in Hz).
-    - delay_ms: Verzögerung des Echos (in Millisekunden).
-    - echo_amplitude: Amplitude des Echos (relativ zur Originaldatenamplitude).
-
-    Rückgabe:
-    - Augmentierte Audiodaten mit Echo.
-    """
-    delay_samples = int(sample_rate * delay_ms / 1000)  # Verzögerung in Samples
-    echo = np.zeros_like(chunk)
-    if delay_samples < len(chunk):  # Sicherstellen, dass Delay nicht größer als die Länge des Chunks ist
-        echo[delay_samples:] = chunk[:-delay_samples] * echo_amplitude
-    return chunk + echo
-
 def _mix_noise(signal, noise, snr_db):
     """Mixes noise at target SNR (dB)."""
     if len(noise) < len(signal):
@@ -195,7 +176,7 @@ def _mix_noise(signal, noise, snr_db):
 
 
 def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20),
-                        p_noise=0.9, rir_list=None, rir_skip_prob=0.5, p_echo=0.3):
+                        p_noise=0.9, rir_list=None, rir_skip_prob=0.5):
     """
     Wendet nur das Hinzufügen von Echos auf die Audiodaten an.
     Augmentiert Chunks: optional Noise-Mix (real-world), immer leichtes Echo.
@@ -228,11 +209,6 @@ def apply_augmentations(chunk, sample_rate, noise_pool=None, snr_range=(0, 20),
             noise = random.choice(noise_pool)
             snr = random.uniform(*snr_range)
             sig = _mix_noise(sig, noise, snr_db=snr)
-        # 2) Echo nur optional
-        if random.random() < p_echo:
-            delay_ms = random.randint(5, 20)
-            echo_amplitude = random.uniform(0.02, 0.08)
-            sig = add_echo(sig, sample_rate, delay_ms, echo_amplitude)
         augmented_chunk[i] = sig
     return augmented_chunk if np.any(augmented_chunk) else chunk
 
