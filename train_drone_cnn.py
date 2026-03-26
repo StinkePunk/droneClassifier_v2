@@ -40,12 +40,6 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import confusion_matrix
 import scipy.signal
 
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-
 # Additional imports for exporting the model to TFLite.  These imports
 # are done lazily inside the conversion function to avoid import
 # failures on systems where ONNX or TensorFlow are not available.
@@ -64,16 +58,16 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# Audio parameters
+SAMPLE_RATE = 16000
+SEG_LEN_SEC = 1  # 2‑second segments
+SEG_LEN = SEG_LEN_SEC * SAMPLE_RATE
+
 # Paths to dataset and RIRs.  Adjust ``DATA_ROOT`` to point to the
 # extracted mini dataset on your machine.  ``RIR_ROOT`` should point to
 # the folder containing RIR wav files.
 DATA_ROOT = "d:/Dropbox/03 H2 Think/AuDroK mFund/Auswertungen/Datensätze/Drone vs. No Drone/"
 RIR_ROOT = "d:/Dropbox/03 H2 Think/AuDroK mFund/Auswertungen/25-03 Drone Classifier/RIRs/"
-
-# Audio parameters
-SAMPLE_RATE = 16000
-SEG_LEN_SEC = 1  # 2‑second segments
-SEG_LEN = SEG_LEN_SEC * SAMPLE_RATE
 
 # Pre‑classification threshold: discard drone segments with low harmonic
 # content.  The threshold 0.7 was chosen empirically.
@@ -86,6 +80,31 @@ P_APPLY_NOISE = 0.8
 P_PITCH_SHIFT = 0.2
 P_TIME_STRETCH = 0.6
 
+SEED = 42  # Global seed for reproducibility
+def _set_global_seed(seed: int) -> None:
+    """Set seeds for python, numpy, torch (and cuda) for reproducibility."""
+    global SEED
+    SEED = int(seed)
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    # optional determinism knobs (safe defaults)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+_set_global_seed(SEED)
+
+def set_experiment_config(seed=None, aug_probs=None):
+    global P_APPLY_RIR, P_APPLY_ECHO, P_APPLY_NOISE, P_PITCH_SHIFT, P_TIME_STRETCH
+    if seed is not None:
+        _set_global_seed(seed)
+    if aug_probs:
+        P_APPLY_RIR = aug_probs.get("P_APPLY_RIR", P_APPLY_RIR)
+        P_APPLY_ECHO = aug_probs.get("P_APPLY_ECHO", P_APPLY_ECHO)
+        P_APPLY_NOISE = aug_probs.get("P_APPLY_NOISE", P_APPLY_NOISE)
+        P_PITCH_SHIFT = aug_probs.get("P_PITCH_SHIFT", P_PITCH_SHIFT)
+        P_TIME_STRETCH = aug_probs.get("P_TIME_STRETCH", P_TIME_STRETCH)
 
 def compute_harmonic_ratio(signal: np.ndarray) -> float:
     """Compute the harmonic ratio of an audio signal using HPSS."""
@@ -329,7 +348,7 @@ def plot_confusion(labels: np.ndarray, probs: np.ndarray, suffix: str) -> str:
     filename = f"confusion_matrix_{suffix}.png"
     fig.savefig(filename)
     plt.close(fig)
-    return filename
+    return filename, cm
 
 
 def plot_probability_distribution(labels: np.ndarray, probs: np.ndarray, suffix: str) -> str:
@@ -444,43 +463,55 @@ class DroneDataset(Dataset):
         return x, y
 
 
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, do_pool: bool = True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.do_pool = do_pool
+        self.pool = nn.MaxPool2d(2, 2) if do_pool else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        return x
+
+
 class ImprovedCNN(nn.Module):
-    """A deeper CNN with four convolutional blocks and dropout."""
+    """Stronger CNN with double conv blocks and global average pooling."""
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(16)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(32)
-        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
-        self.conv4 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(128)
-        self.pool = nn.MaxPool2d(2, 2)
-        with torch.no_grad():
-            # Determine flatten size dynamically by passing a dummy tensor
-            dummy = torch.zeros(1, 1, 64, int(np.ceil((SEG_LEN / 512))))
-            out = self.pool(self.bn1(torch.relu(self.conv1(dummy))))
-            out = self.pool(self.bn2(torch.relu(self.conv2(out))))
-            out = self.pool(self.bn3(torch.relu(self.conv3(out))))
-            out = self.pool(self.bn4(torch.relu(self.conv4(out))))
-            self.flatten_dim = out.numel()
-        self.fc1 = nn.Linear(self.flatten_dim, 128)
-        self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(128, 1)
+
+        self.block1 = ConvBlock(1, 32, do_pool=True)
+        self.block2 = ConvBlock(32, 64, do_pool=True)
+        self.block3 = ConvBlock(64, 128, do_pool=True)
+        self.block4 = ConvBlock(128, 256, do_pool=False)
+
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.fc1 = nn.Linear(256, 64)
+        self.dropout = nn.Dropout(0.4)
+        self.fc2 = nn.Linear(64, 1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pool(self.bn1(torch.relu(self.conv1(x))))
-        x = self.pool(self.bn2(torch.relu(self.conv2(x))))
-        x = self.pool(self.bn3(torch.relu(self.conv3(x))))
-        x = self.pool(self.bn4(torch.relu(self.conv4(x))))
-        x = x.view(x.size(0), -1)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+
+        x = self.global_pool(x)          # shape: [B, 256, 1, 1]
+        x = torch.flatten(x, 1)          # shape: [B, 256]
+
         x = torch.relu(self.fc1(x))
         x = self.dropout(x)
         x = torch.sigmoid(self.fc2(x))
         return x.squeeze(-1)
 
 
-def train_model() -> Tuple[str, str]:
+def train_model(return_outputs=False) -> Tuple[str, str]:
     """Load data, train the CNN and generate evaluation plots."""
     # Load RIRs and noise pool
     rir_pool = load_rir_pool()
@@ -574,7 +605,7 @@ def train_model() -> Tuple[str, str]:
     full_dataset = DroneDataset(full_segments, full_labels)
     full_loader = DataLoader(full_dataset, batch_size=32, shuffle=False)
     full_labels_array, full_probs_array = evaluate_loader(model, full_loader, device)
-    plot_confusion(full_labels_array, full_probs_array, suffix="full")
+    cm = plot_confusion(full_labels_array, full_probs_array, suffix="full")
     plot_probability_distribution(full_labels_array, full_probs_array, suffix="full")
     # ---------------------------------------------------------------------
     # Convert the trained model to TFLite.  The dummy input shape is
@@ -588,8 +619,8 @@ def train_model() -> Tuple[str, str]:
     time_steps = int(np.ceil(SEG_LEN / 512))  # hop length 512 matches extract_logmel
     export_to_tflite(model, device, input_shape=(1, 1, 64, time_steps), filename="trained_model.tflite")
     # Return paths to the confusion matrix of the full dataset and the histogram
-    return
+    if return_outputs:
+        return cm, model
+    
+    return None
 
-
-if __name__ == "__main__":
-    train_model()
