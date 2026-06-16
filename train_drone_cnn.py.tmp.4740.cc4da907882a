@@ -125,61 +125,6 @@ USE_CACHE   = True
 
 
 # ============================================================
-# CACHE-HILFSFUNKTIONEN
-# ============================================================
-
-def _cache_key(name: str, **params) -> Path:
-    """
-    Erstellt einen eindeutigen Dateinamen für eine Cache-Datei.
-
-    Der Dateiname enthält die wichtigsten Parameter als Hash, damit der
-    Cache automatisch ungültig wird, wenn sich Parameter ändern —
-    z.B. wenn IMG_SIZE oder HARM_THRESHOLD geändert wird.
-    """
-    # Parameter zu einem lesbaren String zusammenfügen
-    param_str = "_".join(f"{k}{v}" for k, v in sorted(params.items()))
-    # Kurzen Hash daraus bilden (erste 8 Zeichen reichen zur Unterscheidung)
-    short_hash = hashlib.md5(param_str.encode()).hexdigest()[:8]
-    CACHE_DIR.mkdir(exist_ok=True)
-    return CACHE_DIR / f"{name}_{short_hash}.pkl"
-
-
-def _save_cache(obj, path: Path) -> None:
-    """Speichert ein beliebiges Python-Objekt als Pickle-Datei."""
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
-    print(f"  Cache gespeichert: {path}")
-
-
-def _load_cache(path: Path):
-    """Lädt ein Python-Objekt aus einer Pickle-Datei."""
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def precompute_spectrograms(
-    segments: List[np.ndarray],
-    desc: str = "Spektrogramme vorberechnen",
-) -> List[torch.Tensor]:
-    """
-    Berechnet alle Log-Mel-Spektrogramme einmalig im Voraus.
-
-    Warum das so wichtig ist für die Trainingsgeschwindigkeit:
-    Ohne Vorberechnung ruft PyTorch für JEDES Sample in JEDER Epoche
-    extract_logmel() auf — das sind teure librosa-Operationen.
-    Mit Vorberechnung passiert das nur EINMAL, danach lädt das Dataset
-    nur noch fertige Tensoren aus dem Speicher.
-
-    Beispiel: 3000 Segmente × 20 Epochen = 60.000 librosa-Aufrufe OHNE Cache
-                                          =  3.000 librosa-Aufrufe MIT Cache
-    """
-    tensors = []
-    for seg in tqdm(segments, desc=f"  {desc}", unit="Seg", leave=True):
-        tensors.append(extract_logmel(seg))
-    return tensors
-
-
-# ============================================================
 # REPRODUZIERBARKEIT
 # ============================================================
 
@@ -649,28 +594,28 @@ def spec_augment(
 
 class DroneDataset(Dataset):
     """
-    PyTorch Dataset: Verwaltet vorberechnete Spektrogramm-Tensoren und Labels.
+    PyTorch Dataset: Verwaltet die Liste von Audio-Segmenten und Labels.
 
-    Im Gegensatz zur früheren Version speichert dieses Dataset keine Roh-Audio-
-    Segmente mehr, sondern fertige Tensoren (bereits als Log-Mel-Spektrogramm
-    berechnet). Das macht jeden Datenzugriff im Training sehr schnell:
-    Statt teurer librosa-Operationen findet nur noch ein einfacher Array-Zugriff statt.
+    Ein Dataset ist wie ein intelligentes Array: PyTorch's DataLoader
+    ruft __getitem__(idx) auf, um einzelne Samples zu holen, und kombiniert
+    sie automatisch zu Batches.
 
-    augment=True:  SpecAugment (Frequenz-/Zeitmaskierung) wird online angewendet.
-                   Nur für Trainingsdaten — Validierung ohne Augmentierung.
+    augment=True:  SpecAugment wird auf jeden abgerufenen Sample angewendet
+                   (nur für Trainingsdaten, nicht für Validierung)
     """
 
-    def __init__(self, spec_tensors: List[torch.Tensor], labels: List[int], augment: bool = False):
-        self.specs   = spec_tensors  # Vorberechnete [3, IMG_SIZE, IMG_SIZE] Tensoren
-        self.labels  = labels
-        self.augment = augment
+    def __init__(self, segments: List[np.ndarray], labels: List[int], augment: bool = False):
+        self.segments = segments
+        self.labels   = labels
+        self.augment  = augment
 
     def __len__(self) -> int:
-        return len(self.specs)
+        return len(self.segments)
 
     def __getitem__(self, idx: int):
-        x = self.specs[idx]
-        # Online-Augmentierung: zufällige Maskierung im Spektrogramm
+        # Feature-Extraktion: Audio → Spektrogramm-Tensor
+        x = extract_logmel(self.segments[idx])
+        # Online-Augmentierung (nur beim Training)
         if self.augment:
             x = spec_augment(x)
         y = self.labels[idx]
@@ -932,7 +877,6 @@ def train_model(return_outputs=False):
 
     # ----------------------------------------------------------
     # SCHRITT 1: HILFSDATEN LADEN (RIRs und Noise-Pool)
-    # Diese werden nur für die Augmentierung benötigt und sind schnell zu laden.
     # ----------------------------------------------------------
     print("\n[1/7] Lade Raumimpulsantworten (RIRs) ...")
     rir_pool = load_rir_pool()
@@ -943,94 +887,72 @@ def train_model(return_outputs=False):
     print(f"      {len(noise_pool)} Noise-Segmente geladen.")
 
     # ----------------------------------------------------------
-    # SCHRITT 2 & 3: SEGMENTE LADEN (mit Cache)
-    #
-    # Das Laden + Augmentieren der Audiodateien dauert sehr lang (Stunden).
-    # Deshalb speichern wir das Ergebnis als Cache-Datei auf der Festplatte.
-    # Beim nächsten Start wird die Cache-Datei geladen (Sekunden statt Stunden).
-    #
-    # Der Cache wird automatisch neu erstellt, wenn sich wichtige Parameter
-    # ändern (HARM_THRESHOLD, num_augment, SEG_LEN_SEC, SEED).
-    # Um den Cache manuell zu löschen, einfach den "cache/"-Ordner löschen.
+    # SCHRITT 2: TRAININGSDATEN LADEN
     # ----------------------------------------------------------
-    # Cache-Key enthält alle Parameter, die die Segmente oder Spektrogramme beeinflussen.
-    # Trainingsparameter (LR, Epochen, Batch-Size) sind bewusst NICHT enthalten —
-    # sie beeinflussen die Daten nicht, nur das Training.
-    seg_cache_params = dict(
-        harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED, sr=SAMPLE_RATE,
-        naug=4,  # num_augment — hier ändern wenn load_segments-Aufruf geändert wird
-        rir=round(P_APPLY_RIR, 3), echo=round(P_APPLY_ECHO, 3),
-        noise=round(P_APPLY_NOISE, 3), pitch=round(P_PITCH_SHIFT, 3),
-        stretch=round(P_TIME_STRETCH, 3),
+    print("\n[3/7] Lade Trainingsdaten ...")
+    print("  Drohnen-Segmente (mit Harmonik-Filter + 4× Augmentierung) ...")
+    train_drone_segs, train_drone_labels = load_segments(
+        os.path.join(DATA_ROOT, "TRAINING", "drone"),
+        label=1,
+        pre_classify=True,   # Segmente mit wenig Harmonik herausfiltern
+        noise_pool=noise_pool,
+        rir_pool=rir_pool,
+        augment=True,
+        num_augment=4,       # 4 augmentierte Kopien pro Original-Segment
+        split_name="Training", class_name="Drone",
+        save_mfcc_pngs=False,
     )
-    seg_cache_path = _cache_key("segments", **seg_cache_params)
+    print(f"  → {len(train_drone_segs)} Drohnen-Segmente (inkl. Augmentierungen)")
 
-    if USE_CACHE and seg_cache_path.exists():
-        print(f"\n[3/7] Lade Segmente aus Cache: {seg_cache_path} ...")
-        train_segs, train_labels, val_segs, val_labels = _load_cache(seg_cache_path)
-        print(f"      Cache geladen.")
-    else:
-        print("\n[3/7] Lade und augmentiere Trainingsdaten (einmalig, wird gecacht) ...")
-        print("  Drohnen-Segmente (mit Harmonik-Filter + 4× Augmentierung) ...")
-        train_drone_segs, train_drone_labels = load_segments(
-            os.path.join(DATA_ROOT, "TRAINING", "drone"),
-            label=1,
-            pre_classify=True,
-            noise_pool=noise_pool,
-            rir_pool=rir_pool,
-            augment=True,
-            num_augment=4,
-            split_name="Training", class_name="Drone",
-            save_mfcc_pngs=False,
-        )
-        print(f"  → {len(train_drone_segs)} Drohnen-Segmente (inkl. Augmentierungen)")
+    print("  No-Drone-Segmente (ohne Augmentierung) ...")
+    train_no_segs, train_no_labels = load_segments(
+        os.path.join(DATA_ROOT, "TRAINING", "no drone"),
+        label=0,
+        pre_classify=False,
+        noise_pool=None, rir_pool=None, augment=False,
+        split_name="Training", class_name="No Drone",
+        save_mfcc_pngs=SAVE_MFCC_PNGS,
+    )
+    print(f"  → {len(train_no_segs)} No-Drone-Segmente")
 
-        print("  No-Drone-Segmente (ohne Augmentierung) ...")
-        train_no_segs, train_no_labels = load_segments(
-            os.path.join(DATA_ROOT, "TRAINING", "no drone"),
-            label=0,
-            pre_classify=False,
-            noise_pool=None, rir_pool=None, augment=False,
-            split_name="Training", class_name="No Drone",
-            save_mfcc_pngs=SAVE_MFCC_PNGS,
-        )
-        print(f"  → {len(train_no_segs)} No-Drone-Segmente")
+    # Trainingsset zusammenführen und mischen
+    train_segs   = train_drone_segs + train_no_segs
+    train_labels = train_drone_labels + train_no_labels
+    combined = list(zip(train_segs, train_labels))
+    random.shuffle(combined)
+    train_segs, train_labels = zip(*combined)
 
-        # Trainingsset mischen
-        combined = list(zip(train_drone_segs + train_no_segs,
-                            train_drone_labels + train_no_labels))
-        random.shuffle(combined)
-        train_segs, train_labels = zip(*combined)
-        train_segs, train_labels = list(train_segs), list(train_labels)
+    # ----------------------------------------------------------
+    # SCHRITT 3: VALIDIERUNGSDATEN LADEN
+    # ----------------------------------------------------------
+    print("\n[4/7] Lade Validierungsdaten ...")
+    print("  Drohnen-Segmente (ALLE, kein Harmonik-Filter) ...")
+    # Wichtig: pre_classify=False, damit das Modell an ALLEN Drohnen-Segmenten
+    # validiert wird, nicht nur an den "leichten". Nur so bekommen wir eine
+    # ehrliche Einschätzung der echten Erkennungsleistung.
+    val_drone_segs, val_drone_labels = load_segments(
+        os.path.join(DATA_ROOT, "VALIDATION", "drone"),
+        label=1,
+        pre_classify=False,
+        noise_pool=None, rir_pool=None, augment=False,
+        split_name="Validation", class_name="Drone",
+        save_mfcc_pngs=SAVE_MFCC_PNGS,
+    )
+    print(f"  → {len(val_drone_segs)} Drohnen-Segmente")
 
-        print("\n[4/7] Lade Validierungsdaten ...")
-        print("  Drohnen-Segmente (ALLE, kein Harmonik-Filter) ...")
-        val_drone_segs, val_drone_labels = load_segments(
-            os.path.join(DATA_ROOT, "VALIDATION", "drone"),
-            label=1,
-            pre_classify=False,
-            noise_pool=None, rir_pool=None, augment=False,
-            split_name="Validation", class_name="Drone",
-            save_mfcc_pngs=SAVE_MFCC_PNGS,
-        )
-        print(f"  → {len(val_drone_segs)} Drohnen-Segmente")
+    print("  No-Drone-Segmente ...")
+    val_no_segs, val_no_labels = load_segments(
+        os.path.join(DATA_ROOT, "VALIDATION", "no drone"),
+        label=0,
+        pre_classify=False,
+        noise_pool=None, rir_pool=None, augment=False,
+        split_name="Validation", class_name="No Drone",
+        save_mfcc_pngs=SAVE_MFCC_PNGS,
+    )
+    print(f"  → {len(val_no_segs)} No-Drone-Segmente")
 
-        print("  No-Drone-Segmente ...")
-        val_no_segs, val_no_labels = load_segments(
-            os.path.join(DATA_ROOT, "VALIDATION", "no drone"),
-            label=0,
-            pre_classify=False,
-            noise_pool=None, rir_pool=None, augment=False,
-            split_name="Validation", class_name="No Drone",
-            save_mfcc_pngs=SAVE_MFCC_PNGS,
-        )
-        print(f"  → {len(val_no_segs)} No-Drone-Segmente")
-
-        val_segs   = val_drone_segs + val_no_segs
-        val_labels = val_drone_labels + val_no_labels
-
-        # Cache speichern
-        _save_cache((train_segs, train_labels, val_segs, val_labels), seg_cache_path)
+    val_segs   = val_drone_segs + val_no_segs
+    val_labels = val_drone_labels + val_no_labels
 
     print(f"\n  Trainingsset:    {sum(train_labels)} Drohne / "
           f"{len(train_labels) - sum(train_labels)} Keine Drohne")
@@ -1038,36 +960,12 @@ def train_model(return_outputs=False):
           f"{len(val_labels) - sum(val_labels)} Keine Drohne")
 
     # ----------------------------------------------------------
-    # SCHRITT 4: SPEKTROGRAMME VORBERECHNEN (mit Cache)
-    #
-    # Die Log-Mel-Spektrogramme werden einmalig aus den Roh-Segmenten
-    # berechnet und als Tensoren gespeichert. Das Dataset lädt dann beim
-    # Training nur noch fertige Tensoren — kein librosa mehr pro Epoche.
-    # ----------------------------------------------------------
-    spec_cache_params = dict(**seg_cache_params, img=IMG_SIZE, nmels=N_MELS, hop=HOP_LENGTH)
-    train_spec_cache = _cache_key("train_specs", **spec_cache_params)
-    val_spec_cache   = _cache_key("val_specs",   **spec_cache_params)
-
-    if USE_CACHE and train_spec_cache.exists() and val_spec_cache.exists():
-        print(f"\n[5/7] Lade vorberechnete Spektrogramme aus Cache ...")
-        train_specs = _load_cache(train_spec_cache)
-        val_specs   = _load_cache(val_spec_cache)
-        print(f"      {len(train_specs)} Training- und {len(val_specs)} Val-Tensoren geladen.")
-    else:
-        print("\n[5/7] Berechne Spektrogramme vor (einmalig, wird gecacht) ...")
-        train_specs = precompute_spectrograms(train_segs, desc="Training-Spektrogramme")
-        val_specs   = precompute_spectrograms(val_segs,   desc="Val-Spektrogramme")
-        _save_cache(train_specs, train_spec_cache)
-        _save_cache(val_specs,   val_spec_cache)
-        print(f"      {len(train_specs)} Spektrogramme berechnet und gespeichert.")
-
-    # ----------------------------------------------------------
-    # SCHRITT 5: DATALOADERS AUFBAUEN
+    # SCHRITT 4: DATALOADERS AUFBAUEN
     # ----------------------------------------------------------
     print("\n[5/7] Baue DataLoader auf ...")
 
-    # Trainings-Dataset mit SpecAugment (auf vorberechneten Tensoren)
-    train_dataset = DroneDataset(train_specs, list(train_labels), augment=True)
+    # Trainings-Dataset mit SpecAugment
+    train_dataset = DroneDataset(list(train_segs), list(train_labels), augment=True)
 
     # WeightedRandomSampler: gleicht Klassenungleichgewichte aus,
     # indem er häufig unterrepräsentierte Klassen zieht.
@@ -1079,7 +977,7 @@ def train_model(return_outputs=False):
         weights=sample_weights, num_samples=len(sample_weights), replacement=True
     )
 
-    val_dataset = DroneDataset(val_specs, list(val_labels), augment=False)
+    val_dataset = DroneDataset(val_segs, val_labels, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler, num_workers=0)
     val_loader   = DataLoader(val_dataset,   batch_size=16, shuffle=False,   num_workers=0)
@@ -1269,35 +1167,22 @@ def train_model(return_outputs=False):
     plot_probability_distribution(full_labels, full_probs, suffix="full")
     cm_abs = confusion_matrix(full_labels, (full_probs >= 0.5).astype(int), labels=[1, 0])
 
-    # Evaluierung mit Harmonik-Filter: zeigt Performance auf "einfachen" Segmenten.
-    # Wir filtern die vorberechneten Val-Spektrogramme nach Harmonik-Label.
-    # Dafür laden wir die Drohnen-Segmente nochmal kurz, um den Filter anzuwenden.
+    # Evaluierung mit Harmonik-Filter: zeigt Performance auf "einfachen" Segmenten
     print("  Auswertung auf harmonisch gefilterten Drohnen-Segmenten ...")
-    preclass_cache = _cache_key("preclass_segs", **seg_cache_params)
-    if USE_CACHE and preclass_cache.exists():
-        preclass_segs_raw, preclass_labels_raw = _load_cache(preclass_cache)
-    else:
-        preclass_drone_segs, preclass_drone_labels = load_segments(
-            os.path.join(DATA_ROOT, "VALIDATION", "drone"),
-            label=1, pre_classify=True, noise_pool=None, rir_pool=None, augment=False,
-        )
-        preclass_no_segs, preclass_no_labels = load_segments(
-            os.path.join(DATA_ROOT, "VALIDATION", "no drone"),
-            label=0, pre_classify=False, noise_pool=None, rir_pool=None, augment=False,
-        )
-        preclass_segs_raw   = preclass_drone_segs + preclass_no_segs
-        preclass_labels_raw = preclass_drone_labels + preclass_no_labels
-        _save_cache((preclass_segs_raw, preclass_labels_raw), preclass_cache)
-
-    preclass_spec_cache = _cache_key("preclass_specs", **spec_cache_params)
-    if USE_CACHE and preclass_spec_cache.exists():
-        preclass_specs = _load_cache(preclass_spec_cache)
-    else:
-        preclass_specs = precompute_spectrograms(preclass_segs_raw, desc="Preclass-Spektrogramme")
-        _save_cache(preclass_specs, preclass_spec_cache)
-
-    preclass_dataset = DroneDataset(preclass_specs, preclass_labels_raw, augment=False)
-    preclass_loader  = DataLoader(preclass_dataset, batch_size=16, shuffle=False, num_workers=0)
+    preclass_drone_segs, preclass_drone_labels = load_segments(
+        os.path.join(DATA_ROOT, "VALIDATION", "drone"),
+        label=1, pre_classify=True, noise_pool=None, rir_pool=None, augment=False,
+    )
+    preclass_no_segs, preclass_no_labels = load_segments(
+        os.path.join(DATA_ROOT, "VALIDATION", "no drone"),
+        label=0, pre_classify=False, noise_pool=None, rir_pool=None, augment=False,
+    )
+    preclass_dataset = DroneDataset(
+        preclass_drone_segs + preclass_no_segs,
+        preclass_drone_labels + preclass_no_labels,
+        augment=False,
+    )
+    preclass_loader = DataLoader(preclass_dataset, batch_size=16, shuffle=False, num_workers=0)
     preclass_labels, preclass_probs = evaluate_loader(
         model, preclass_loader, device, desc="  Gefiltertes Val-Set"
     )

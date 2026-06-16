@@ -953,15 +953,9 @@ def train_model(return_outputs=False):
     # ändern (HARM_THRESHOLD, num_augment, SEG_LEN_SEC, SEED).
     # Um den Cache manuell zu löschen, einfach den "cache/"-Ordner löschen.
     # ----------------------------------------------------------
-    # Cache-Key enthält alle Parameter, die die Segmente oder Spektrogramme beeinflussen.
-    # Trainingsparameter (LR, Epochen, Batch-Size) sind bewusst NICHT enthalten —
-    # sie beeinflussen die Daten nicht, nur das Training.
     seg_cache_params = dict(
-        harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED, sr=SAMPLE_RATE,
-        naug=4,  # num_augment — hier ändern wenn load_segments-Aufruf geändert wird
-        rir=round(P_APPLY_RIR, 3), echo=round(P_APPLY_ECHO, 3),
-        noise=round(P_APPLY_NOISE, 3), pitch=round(P_PITCH_SHIFT, 3),
-        stretch=round(P_TIME_STRETCH, 3),
+        harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED,
+        naug=4, sr=SAMPLE_RATE,
     )
     seg_cache_path = _cache_key("segments", **seg_cache_params)
 
@@ -1079,7 +1073,7 @@ def train_model(return_outputs=False):
         weights=sample_weights, num_samples=len(sample_weights), replacement=True
     )
 
-    val_dataset = DroneDataset(val_specs, list(val_labels), augment=False)
+    val_dataset = DroneDataset(val_segs, val_labels, augment=False)
 
     train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler, num_workers=0)
     val_loader   = DataLoader(val_dataset,   batch_size=16, shuffle=False,   num_workers=0)
@@ -1269,35 +1263,22 @@ def train_model(return_outputs=False):
     plot_probability_distribution(full_labels, full_probs, suffix="full")
     cm_abs = confusion_matrix(full_labels, (full_probs >= 0.5).astype(int), labels=[1, 0])
 
-    # Evaluierung mit Harmonik-Filter: zeigt Performance auf "einfachen" Segmenten.
-    # Wir filtern die vorberechneten Val-Spektrogramme nach Harmonik-Label.
-    # Dafür laden wir die Drohnen-Segmente nochmal kurz, um den Filter anzuwenden.
+    # Evaluierung mit Harmonik-Filter: zeigt Performance auf "einfachen" Segmenten
     print("  Auswertung auf harmonisch gefilterten Drohnen-Segmenten ...")
-    preclass_cache = _cache_key("preclass_segs", **seg_cache_params)
-    if USE_CACHE and preclass_cache.exists():
-        preclass_segs_raw, preclass_labels_raw = _load_cache(preclass_cache)
-    else:
-        preclass_drone_segs, preclass_drone_labels = load_segments(
-            os.path.join(DATA_ROOT, "VALIDATION", "drone"),
-            label=1, pre_classify=True, noise_pool=None, rir_pool=None, augment=False,
-        )
-        preclass_no_segs, preclass_no_labels = load_segments(
-            os.path.join(DATA_ROOT, "VALIDATION", "no drone"),
-            label=0, pre_classify=False, noise_pool=None, rir_pool=None, augment=False,
-        )
-        preclass_segs_raw   = preclass_drone_segs + preclass_no_segs
-        preclass_labels_raw = preclass_drone_labels + preclass_no_labels
-        _save_cache((preclass_segs_raw, preclass_labels_raw), preclass_cache)
-
-    preclass_spec_cache = _cache_key("preclass_specs", **spec_cache_params)
-    if USE_CACHE and preclass_spec_cache.exists():
-        preclass_specs = _load_cache(preclass_spec_cache)
-    else:
-        preclass_specs = precompute_spectrograms(preclass_segs_raw, desc="Preclass-Spektrogramme")
-        _save_cache(preclass_specs, preclass_spec_cache)
-
-    preclass_dataset = DroneDataset(preclass_specs, preclass_labels_raw, augment=False)
-    preclass_loader  = DataLoader(preclass_dataset, batch_size=16, shuffle=False, num_workers=0)
+    preclass_drone_segs, preclass_drone_labels = load_segments(
+        os.path.join(DATA_ROOT, "VALIDATION", "drone"),
+        label=1, pre_classify=True, noise_pool=None, rir_pool=None, augment=False,
+    )
+    preclass_no_segs, preclass_no_labels = load_segments(
+        os.path.join(DATA_ROOT, "VALIDATION", "no drone"),
+        label=0, pre_classify=False, noise_pool=None, rir_pool=None, augment=False,
+    )
+    preclass_dataset = DroneDataset(
+        preclass_drone_segs + preclass_no_segs,
+        preclass_drone_labels + preclass_no_labels,
+        augment=False,
+    )
+    preclass_loader = DataLoader(preclass_dataset, batch_size=16, shuffle=False, num_workers=0)
     preclass_labels, preclass_probs = evaluate_loader(
         model, preclass_loader, device, desc="  Gefiltertes Val-Set"
     )

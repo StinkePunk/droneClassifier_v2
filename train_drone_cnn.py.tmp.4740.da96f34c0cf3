@@ -953,15 +953,9 @@ def train_model(return_outputs=False):
     # ändern (HARM_THRESHOLD, num_augment, SEG_LEN_SEC, SEED).
     # Um den Cache manuell zu löschen, einfach den "cache/"-Ordner löschen.
     # ----------------------------------------------------------
-    # Cache-Key enthält alle Parameter, die die Segmente oder Spektrogramme beeinflussen.
-    # Trainingsparameter (LR, Epochen, Batch-Size) sind bewusst NICHT enthalten —
-    # sie beeinflussen die Daten nicht, nur das Training.
     seg_cache_params = dict(
-        harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED, sr=SAMPLE_RATE,
-        naug=4,  # num_augment — hier ändern wenn load_segments-Aufruf geändert wird
-        rir=round(P_APPLY_RIR, 3), echo=round(P_APPLY_ECHO, 3),
-        noise=round(P_APPLY_NOISE, 3), pitch=round(P_PITCH_SHIFT, 3),
-        stretch=round(P_TIME_STRETCH, 3),
+        harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED,
+        naug=4, sr=SAMPLE_RATE,
     )
     seg_cache_path = _cache_key("segments", **seg_cache_params)
 

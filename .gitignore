@@ -3,8 +3,10 @@
 f
 models
 plots
+MFCCs
 *.h5
 *.keras
 *.pkl
 *.onnx
 *.data
+*.png
