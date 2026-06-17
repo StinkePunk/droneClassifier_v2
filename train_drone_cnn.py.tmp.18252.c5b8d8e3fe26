@@ -793,8 +793,7 @@ def evaluate_loader(
 # PLOTS: KONFUSIONSMATRIX UND WAHRSCHEINLICHKEITSVERTEILUNG
 # ============================================================
 
-def plot_confusion(labels: np.ndarray, probs: np.ndarray, suffix: str,
-                   threshold: float = 0.5) -> str:
+def plot_confusion(labels: np.ndarray, probs: np.ndarray, suffix: str) -> str:
     """
     Erstellt eine Konfusionsmatrix und speichert sie als PNG.
 
@@ -803,10 +802,9 @@ def plot_confusion(labels: np.ndarray, probs: np.ndarray, suffix: str,
       - Spalten: Vorhergesagte Klasse
       - Werte: Absolute Anzahl + prozentualer Anteil
 
-    threshold: Schwellenwert für die Entscheidung (Standard 0.5).
-               Niedrigere Werte → mehr Drohnen erkannt, mehr Fehlalarme.
+    Ideales Ergebnis: Hohe Werte auf der Diagonalen, niedrige außerhalb.
     """
-    preds = (probs >= threshold).astype(int)
+    preds = (probs >= 0.5).astype(int)  # Schwellenwert 0.5: ab hier = "Drohne"
     cm = confusion_matrix(labels, preds, labels=[1, 0])
     # Normieren: Jede Zeile auf 100% (relative Erkennungsrate pro echter Klasse)
     cm_percent = cm.astype(float) / cm.sum(axis=1, keepdims=True)
@@ -818,7 +816,7 @@ def plot_confusion(labels: np.ndarray, probs: np.ndarray, suffix: str,
     ax.set_yticks([0, 1]);  ax.set_yticklabels(classes)
     ax.set_xlabel("Vorhergesagt")
     ax.set_ylabel("Echt")
-    ax.set_title(f"Konfusionsmatrix ({suffix}, T={threshold:.2f})")
+    ax.set_title(f"Konfusionsmatrix ({suffix})")
 
     for i in range(2):
         for j in range(2):
@@ -1080,7 +1078,7 @@ def train_model(return_outputs=False):
     # sie beeinflussen die Daten nicht, nur das Training.
     seg_cache_params = dict(
         harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED, sr=SAMPLE_RATE,
-        naug=8,  # num_augment — muss mit dem Wert im load_segments-Aufruf übereinstimmen
+        naug=4,  # num_augment — hier ändern wenn load_segments-Aufruf geändert wird
         rir=round(P_APPLY_RIR, 3), echo=round(P_APPLY_ECHO, 3),
         noise=round(P_APPLY_NOISE, 3), pitch=round(P_PITCH_SHIFT, 3),
         stretch=round(P_TIME_STRETCH, 3),
@@ -1101,7 +1099,7 @@ def train_model(return_outputs=False):
             noise_pool=noise_pool,
             rir_pool=rir_pool,
             augment=True,
-            num_augment=8,  # 8 augmentierte Kopien pro Original-Segment
+            num_augment=4,
             split_name="Training", class_name="Drone",
             save_mfcc_pngs=False,
         )
@@ -1213,14 +1211,8 @@ def train_model(return_outputs=False):
     print(f"  Rechengerät: {device}")
     model = DroneClassifier().to(device)
 
-    # pos_weight=2: Eine verpasste Drohne wird doppelt so stark bestraft wie
-    # ein falscher Alarm. Das verschiebt das Modell Richtung höherer Recall.
-    # Den Tradeoff steuern wir anschließend fein über den Threshold.
-    # Erhöhen (z.B. 3–4) = noch mehr Recall, aber mehr Fehlalarme.
-    POS_WEIGHT = 2.0
-    criterion = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor([POS_WEIGHT], device=device)
-    )
+    # BCEWithLogitsLoss = Sigmoid + Binary Cross-Entropy kombiniert (numerisch stabiler)
+    criterion = nn.BCEWithLogitsLoss()
 
     # Label Smoothing: statt harten 0/1-Zielen verwenden wir 0.05/0.95.
     # Das verhindert, dass das Modell überentspannt in eine Richtung zieht.
@@ -1267,11 +1259,6 @@ def train_model(return_outputs=False):
                 # Label Smoothing: 0 → 0.05, 1 → 0.95
                 y_smooth = y_batch.float() * (1.0 - 2 * label_smoothing) + label_smoothing
                 y_smooth = y_smooth.to(device)
-
-                # Mixup: mit 50% Wahrscheinlichkeit zwei Samples mischen.
-                # Nur im Training, nicht bei der Validierung.
-                if random.random() < 0.5:
-                    X_batch, y_smooth = mixup_batch(X_batch, y_smooth, alpha=0.3)
 
                 optimizer.zero_grad()          # Gradienten aus vorheriger Iteration löschen
                 outputs = model(X_batch)       # Vorwärtsdurchlauf
@@ -1385,26 +1372,6 @@ def train_model(return_outputs=False):
         optimizer2, epochs=15, phase_name="Phase2", scheduler=scheduler2
     )
 
-    # ----------------------------------------------------------
-    # PHASE 3: VOLLSTÄNDIGES FINE-TUNING ALLER SCHICHTEN
-    # Mit sehr kleiner LR, damit die vortrainierten Gewichte nicht
-    # zerstört werden. Nur sinnvoll, wenn Phase 2 noch nicht konvergiert ist.
-    # ----------------------------------------------------------
-    print("\n[6/7] Training Phase 3: Vollständiges Fine-Tuning aller Schichten ...")
-    print("      (Alle Backbone-Schichten freigegeben, sehr niedrige LR)")
-    for param in model.backbone.parameters():
-        param.requires_grad = True
-
-    optimizer3 = torch.optim.Adam([
-        {"params": model.backbone.features.parameters(),   "lr": 1e-6},
-        {"params": model.backbone.classifier.parameters(), "lr": 1e-5},
-    ])
-    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer3, T_max=10, eta_min=1e-8)
-
-    best_balacc, best_state, patience_counter = run_epochs(
-        optimizer3, epochs=10, phase_name="Phase3", scheduler=scheduler3
-    )
-
     # Bestes Modell wiederherstellen
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -1418,26 +1385,9 @@ def train_model(return_outputs=False):
     # Evaluierung auf ALLEN Validierungs-Segmenten (kein Harmonik-Filter)
     print("  Auswertung auf vollständigem Validierungsset ...")
     full_labels, full_probs = evaluate_loader(model, val_loader, device, desc="  Vollständiges Val-Set")
-
-    # Threshold-Optimierung: findet den besten Schwellenwert auf dem Validierungsset.
-    # "Bester F1" = ausgewogen; "Max Recall bei Prec≥90%" = für unsere Anwendung relevant.
-    print("  Suche optimalen Threshold ...")
-    f1_thresh, best_f1, recall_thresh, best_recall = find_optimal_threshold(
-        full_labels, full_probs, min_precision=0.90
-    )
-    print(f"  → Bester F1-Threshold:              T={f1_thresh:.3f}  (F1={best_f1:.3f})")
-    print(f"  → Max-Recall bei Prec≥90%-Threshold: T={recall_thresh:.3f} (Recall={best_recall:.3f})")
-
-    # Konfusionsmatrix mit Threshold=0.5 (bisheriger Standard)
-    plot_confusion(full_labels, full_probs, suffix="full_t050")
-    # Konfusionsmatrix mit F1-optimiertem Threshold
-    plot_confusion(full_labels, full_probs, suffix=f"full_f1thresh{f1_thresh:.2f}",
-                   threshold=f1_thresh)
-    # Konfusionsmatrix mit Recall-optimiertem Threshold
-    plot_confusion(full_labels, full_probs, suffix=f"full_recallthresh{recall_thresh:.2f}",
-                   threshold=recall_thresh)
+    plot_confusion(full_labels, full_probs, suffix="full")
     plot_probability_distribution(full_labels, full_probs, suffix="full")
-    cm_abs = confusion_matrix(full_labels, (full_probs >= recall_thresh).astype(int), labels=[1, 0])
+    cm_abs = confusion_matrix(full_labels, (full_probs >= 0.5).astype(int), labels=[1, 0])
 
     # Evaluierung mit Harmonik-Filter: zeigt Performance auf "einfachen" Segmenten.
     # Wir filtern die vorberechneten Val-Spektrogramme nach Harmonik-Label.

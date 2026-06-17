@@ -1080,7 +1080,7 @@ def train_model(return_outputs=False):
     # sie beeinflussen die Daten nicht, nur das Training.
     seg_cache_params = dict(
         harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED, sr=SAMPLE_RATE,
-        naug=8,  # num_augment — muss mit dem Wert im load_segments-Aufruf übereinstimmen
+        naug=4,  # num_augment — hier ändern wenn load_segments-Aufruf geändert wird
         rir=round(P_APPLY_RIR, 3), echo=round(P_APPLY_ECHO, 3),
         noise=round(P_APPLY_NOISE, 3), pitch=round(P_PITCH_SHIFT, 3),
         stretch=round(P_TIME_STRETCH, 3),
@@ -1383,26 +1383,6 @@ def train_model(return_outputs=False):
 
     best_balacc, best_state, patience_counter = run_epochs(
         optimizer2, epochs=15, phase_name="Phase2", scheduler=scheduler2
-    )
-
-    # ----------------------------------------------------------
-    # PHASE 3: VOLLSTÄNDIGES FINE-TUNING ALLER SCHICHTEN
-    # Mit sehr kleiner LR, damit die vortrainierten Gewichte nicht
-    # zerstört werden. Nur sinnvoll, wenn Phase 2 noch nicht konvergiert ist.
-    # ----------------------------------------------------------
-    print("\n[6/7] Training Phase 3: Vollständiges Fine-Tuning aller Schichten ...")
-    print("      (Alle Backbone-Schichten freigegeben, sehr niedrige LR)")
-    for param in model.backbone.parameters():
-        param.requires_grad = True
-
-    optimizer3 = torch.optim.Adam([
-        {"params": model.backbone.features.parameters(),   "lr": 1e-6},
-        {"params": model.backbone.classifier.parameters(), "lr": 1e-5},
-    ])
-    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer3, T_max=10, eta_min=1e-8)
-
-    best_balacc, best_state, patience_counter = run_epochs(
-        optimizer3, epochs=10, phase_name="Phase3", scheduler=scheduler3
     )
 
     # Bestes Modell wiederherstellen

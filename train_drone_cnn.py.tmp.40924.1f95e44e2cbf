@@ -1385,26 +1385,6 @@ def train_model(return_outputs=False):
         optimizer2, epochs=15, phase_name="Phase2", scheduler=scheduler2
     )
 
-    # ----------------------------------------------------------
-    # PHASE 3: VOLLSTÄNDIGES FINE-TUNING ALLER SCHICHTEN
-    # Mit sehr kleiner LR, damit die vortrainierten Gewichte nicht
-    # zerstört werden. Nur sinnvoll, wenn Phase 2 noch nicht konvergiert ist.
-    # ----------------------------------------------------------
-    print("\n[6/7] Training Phase 3: Vollständiges Fine-Tuning aller Schichten ...")
-    print("      (Alle Backbone-Schichten freigegeben, sehr niedrige LR)")
-    for param in model.backbone.parameters():
-        param.requires_grad = True
-
-    optimizer3 = torch.optim.Adam([
-        {"params": model.backbone.features.parameters(),   "lr": 1e-6},
-        {"params": model.backbone.classifier.parameters(), "lr": 1e-5},
-    ])
-    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer3, T_max=10, eta_min=1e-8)
-
-    best_balacc, best_state, patience_counter = run_epochs(
-        optimizer3, epochs=10, phase_name="Phase3", scheduler=scheduler3
-    )
-
     # Bestes Modell wiederherstellen
     if best_state is not None:
         model.load_state_dict(best_state)
