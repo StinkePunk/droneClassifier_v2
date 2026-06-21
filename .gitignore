@@ -1,5 +1,6 @@
 .venv
 .ipynb_checkpoints
+__pycache__
 f
 models
 plots
@@ -10,3 +11,4 @@ MFCCs
 *.onnx
 *.data
 *.png
+*.tmp.[0-9]*.[0-9a-f]*

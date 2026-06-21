@@ -23,6 +23,7 @@ import sys      # System-Eingriffe (hier: Jupyter-Hook unterdrücken)
 import types    # Wird gebraucht, um einen Dummy-Modul-Eintrag zu setzen
 import random   # Zufallszahlen für Augmentierung
 from typing import List, Tuple  # Typ-Hinweise für Funktionsparameter
+from concurrent.futures import ThreadPoolExecutor  # Parallelisierung der Augmentierung
 
 import pickle     # Zum Speichern und Laden von Python-Objekten (Cache)
 import hashlib   # Zum Erstellen von Prüfsummen (Cache-Schlüssel)
@@ -35,7 +36,7 @@ import torch.nn.functional as F  # Zustandslose Funktionen (z.B. interpolate)
 import scipy.signal         # Signalverarbeitung (hier: Tiefpassfilter für Echo)
 
 # Vortrainiertes MobileNetV3-Small Modell aus torchvision
-from torchvision.models import mobilenet_v3_small, MobileNet_V3_Small_Weights
+import timm  # PyTorch Image Models — liefert EfficientNet-B0 mit vortrainierten Gewichten
 
 # Dataset/DataLoader verwalten, wie Daten in Batches ans Netz gegeben werden
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
@@ -81,10 +82,11 @@ SEG_LEN = SEG_LEN_SEC * SAMPLE_RATE  # = 16000 Samples pro Segment
 # Mel-Spektrogramm-Parameter
 N_MELS = 128              # Anzahl der Mel-Frequenzbänder (Auflösung auf der Frequenzachse)
 HOP_LENGTH = 256          # Schrittweite zwischen zwei Spektrogramm-Frames (ca. 16 ms)
-IMG_SIZE = 96             # 96×96 reicht für Spektrogramme völlig aus und ist ~5× schneller als 224×224
+IMG_H = 128               # Frequenzachse: entspricht genau den N_MELS=128 Bändern → kein Informationsverlust
+IMG_W = 64                # Zeitachse: bei 1 s / HOP=256 / SR=16000 entstehen ~63 Frames → auf 64 aufgerundet
 
 # Ob Debug-Spektrogramme als PNG gespeichert werden sollen
-SAVE_MFCC_PNGS = True
+SAVE_MFCC_PNGS = False  # True nur für Debugging: erzeugt tausende PNG-Schreibvorgänge
 MFCC_DEBUG_ROOT = "MFCCs"
 
 # ImageNet-Normalisierungswerte: Diese Mittelwerte und Standardabweichungen wurden
@@ -112,6 +114,13 @@ P_APPLY_NOISE  = 0.8   # Hintergrundgeräusch hinzumischen
 P_PITCH_SHIFT  = 0.2   # Tonhöhe verschieben
 P_TIME_STRETCH = 0.6   # Zeitstreckung/-stauchung
 
+# Abstandsdämpfung: simuliert eine Drohne auf variabler Entfernung.
+# REF_DISTANCE_M: Aufnahmeabstand in der reflexionsarmen Kammer (~1.5 m).
+# Die Dämpfung folgt dem 1/r-Gesetz (Schalldruckpegel sinkt 6 dB pro Entfernungsverdopplung).
+P_DISTANCE_ATT   = 0.6    # Wahrscheinlichkeit, die Dämpfung anzuwenden
+REF_DISTANCE_M   = 1.5    # Referenzentfernung der Kammeraufnahmen in Metern
+MAX_DISTANCE_M   = 30.0   # Maximale simulierte Entfernung in Metern
+
 # Zufalls-Seed: Sorgt dafür, dass die Ergebnisse reproduzierbar sind.
 # Mit dem gleichen Seed bekommt man bei gleichem Datensatz immer das gleiche Ergebnis.
 SEED = 42
@@ -134,7 +143,7 @@ def _cache_key(name: str, **params) -> Path:
 
     Der Dateiname enthält die wichtigsten Parameter als Hash, damit der
     Cache automatisch ungültig wird, wenn sich Parameter ändern —
-    z.B. wenn IMG_SIZE oder HARM_THRESHOLD geändert wird.
+    z.B. wenn IMG_H, IMG_W oder HARM_THRESHOLD geändert wird.
     """
     # Parameter zu einem lesbaren String zusammenfügen
     param_str = "_".join(f"{k}{v}" for k, v in sorted(params.items()))
@@ -296,6 +305,9 @@ def load_rir_pool() -> List[np.ndarray]:
         try:
             rir, _ = librosa.load(path, sr=SAMPLE_RATE)
             rir = rir.astype(np.float32)
+            # Auf 0.5 s kürzen: Frühe Reflexionen sind klanglich relevant,
+            # der lange Hallausklang verdoppelt nur die FFT-Größe ohne Nutzen.
+            rir = rir[: SAMPLE_RATE // 2]
             # Normierung: Spitzenwert auf 1 setzen, damit die RIR das Signal
             # nicht unbeabsichtigt laut oder leise macht
             if np.max(np.abs(rir)) > 1e-6:
@@ -313,18 +325,17 @@ def load_rir_pool() -> List[np.ndarray]:
 
 def convolve_rir(signal: np.ndarray, rir: np.ndarray) -> np.ndarray:
     """
-    Faltet ein Audiosignal mit einer Raumimpulsantwort.
+    Faltet ein Audiosignal mit einer Raumimpulsantwort (FFT-basiert).
 
-    Faltung im Zeitbereich: Das Ergebnis ist länger als das Eingangssignal
-    (wegen dem Nachhall). Wir schneiden es auf die Originallänge zurück.
+    scipy.signal.fftconvolve ist O((n+m)·log(n+m)) statt O(n·m) bei np.convolve —
+    bei typischen RIRs 100–500× schneller.
     """
-    conv = np.convolve(signal, rir, mode="full")
-    # Auf Originallänge kürzen oder auffüllen
+    conv = scipy.signal.fftconvolve(signal, rir, mode="full")
     if len(conv) >= len(signal):
         conv = conv[: len(signal)]
     else:
         conv = np.pad(conv, (0, len(signal) - len(conv)))
-    return conv
+    return conv.astype(signal.dtype)
 
 
 def add_ground_reflection(signal: np.ndarray, delay_ms: float, amplitude: float) -> np.ndarray:
@@ -373,31 +384,54 @@ def mix_noise(clean: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarray
 
 def pitch_shift(signal: np.ndarray, steps: float) -> np.ndarray:
     """
-    Verschiebt die Tonhöhe des Signals um 'steps' Halbtöne.
-    Positive Werte = höher, negative Werte = tiefer.
-    Typisch: ±2 Halbtöne, was einer Tempoänderung der Rotoren entspricht.
+    Verschiebt die Tonhöhe um 'steps' Halbtöne via scipy.signal.resample.
+    Ändert Pitch und Tempo gleichzeitig (physikalisch: andere Rotordrehzahl).
+    ~20× schneller als librosa's Phase-Vocoder — für Augmentierung völlig ausreichend.
     """
-    shifted = librosa.effects.pitch_shift(signal, sr=SAMPLE_RATE, n_steps=steps)
-    # Auf exakt SEG_LEN kürzen oder auffüllen (librosa kann Länge leicht verändern)
-    if len(shifted) > len(signal):
-        shifted = shifted[: len(signal)]
-    elif len(shifted) < len(signal):
-        shifted = np.pad(shifted, (0, len(signal) - len(shifted)))
-    return shifted.astype(signal.dtype)
+    factor = 2 ** (steps / 12.0)
+    n_new = int(round(len(signal) / factor))
+    resampled = scipy.signal.resample(signal, n_new)
+    if len(resampled) > len(signal):
+        resampled = resampled[: len(signal)]
+    else:
+        resampled = np.pad(resampled, (0, len(signal) - len(resampled)))
+    return resampled.astype(signal.dtype)
 
 
 def time_stretch(signal: np.ndarray, rate: float) -> np.ndarray:
     """
-    Streckt oder staucht das Signal zeitlich um den Faktor 'rate'.
+    Streckt/staucht das Signal zeitlich um Faktor 'rate' via scipy.signal.resample.
     rate > 1.0 = schneller (kürzer), rate < 1.0 = langsamer (länger).
-    Typisch: 0.9–1.1 (±10%), simuliert unterschiedliche Drohnengeschwindigkeiten.
+    ~10× schneller als librosa's Phase-Vocoder — für Augmentierung völlig ausreichend.
     """
-    stretched = librosa.effects.time_stretch(signal, rate=rate)
+    n_new = int(round(len(signal) / rate))
+    stretched = scipy.signal.resample(signal, n_new)
     if len(stretched) > len(signal):
         stretched = stretched[: len(signal)]
     else:
         stretched = np.pad(stretched, (0, len(signal) - len(stretched)))
     return stretched.astype(signal.dtype)
+
+
+def apply_distance_attenuation(
+    signal: np.ndarray,
+    target_distance_m: float,
+    ref_distance_m: float = REF_DISTANCE_M,
+) -> np.ndarray:
+    """
+    Simuliert die Schalldruckabnahme mit zunehmender Entfernung (1/r-Gesetz).
+
+    Im Freifeld nimmt der Schalldruck linear mit der Entfernung ab:
+    Verdopplung der Entfernung = halbe Amplitude = −6 dB.
+
+    Beispiel: Drohne auf 15 m statt 1.5 m → Faktor 0.1 → −20 dB leiser.
+
+    Diese Augmentierung ist wichtig, weil die Outdoor-Validierungsaufnahmen
+    Drohnen in Entfernungen von ~1 m bis ~30 m enthalten, während die
+    Kammer-Trainingsaufnahmen nur ~1.5 m Abstand haben.
+    """
+    attenuation = ref_distance_m / max(target_distance_m, ref_distance_m)
+    return signal * attenuation
 
 
 def load_noise_pool(no_folder: str) -> List[np.ndarray]:
@@ -443,31 +477,36 @@ def augment_signal(
     """
     aug = signal.copy()
 
-    # 1. Raumimpulsantwort falten (Drohne klingt wie in einem Raum)
+    # 1. Abstandsdämpfung: simuliert eine Drohne auf variabler Entfernung.
+    #    Muss VOR der RIR-Faltung und dem Noise-Mixing passieren, damit
+    #    das resultierende SNR realistisch ist (leise Drohne + Umgebungslärm).
+    if random.random() < P_DISTANCE_ATT:
+        dist = random.uniform(REF_DISTANCE_M, MAX_DISTANCE_M)
+        aug = apply_distance_attenuation(aug, target_distance_m=dist)
+
+    # 2. Raumimpulsantwort falten (Drohne klingt wie in einem Raum)
     if rir_pool and random.random() < P_APPLY_RIR:
         rir = random.choice(rir_pool)
         aug = convolve_rir(aug, rir)
 
-    # 2. Bodenreflexion simulieren (kurzes Echo von unten)
+    # 3. Bodenreflexion simulieren (kurzes Echo von unten)
     if random.random() < P_APPLY_ECHO:
-        delay = random.randint(5, 30)           # 5–30 ms Verzögerung
-        amp   = random.uniform(0.02, 0.08)     # 2–8% Amplitude
+        delay = random.randint(5, 30)
+        amp   = random.uniform(0.02, 0.08)
         aug = add_ground_reflection(aug, delay_ms=delay, amplitude=amp)
 
-    # 3. Hintergrundgeräusch hinzumischen
+    # 4. Hintergrundgeräusch hinzumischen — SNR relativ zur (gedämpften) Drohne
     if noise_pool and random.random() < P_APPLY_NOISE:
         noise_seg = random.choice(noise_pool)
-        # 0–20 dB: verschiebt das Training zu schwerer hörbaren Drohnen.
-        # 0 dB = Drohne und Rauschen gleich laut; 20 dB = Drohne klar hörbar.
         snr = random.uniform(0, 20)
         aug = mix_noise(aug, noise_seg, snr_db=snr)
 
-    # 4. Tonhöhe verschieben (±2 Halbtöne)
+    # 5. Tonhöhe verschieben (±2 Halbtöne)
     if random.random() < P_PITCH_SHIFT:
         steps = random.uniform(-2, 2)
         aug = pitch_shift(aug, steps)
 
-    # 5. Zeitstreckung (±10%)
+    # 6. Zeitstreckung (±10%)
     if random.random() < P_TIME_STRETCH:
         rate = random.uniform(0.9, 1.1)
         aug = time_stretch(aug, rate)
@@ -551,12 +590,28 @@ def load_segments(
             segments.append(seg)
             labels.append(label)
 
-            # Augmentierte Kopien hinzufügen (nur für Drohnen-Trainings-Segmente)
-            if label == 1 and augment:
-                for _ in range(num_augment):
-                    aug = augment_signal(seg, noise_pool, rir_pool)
-                    segments.append(aug)
-                    labels.append(label)
+    # Augmentierte Kopien parallel erstellen (nur Drohnen-Trainings-Segmente)
+    # ThreadPoolExecutor: scipy/numpy geben das GIL während FFT-Operationen frei
+    # → echte Parallelität ohne Multiprocessing-Overhead
+    if label == 1 and augment and num_augment > 0:
+        n_workers = min(8, (os.cpu_count() or 2))
+
+        def _aug_one(seg):
+            return [augment_signal(seg, noise_pool, rir_pool) for _ in range(num_augment)]
+
+        aug_segs: List[np.ndarray] = []
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = list(tqdm(
+                executor.map(_aug_one, segments),
+                total=len(segments),
+                desc=f"  {class_name or 'Drone'} augmentieren ({n_workers} Threads)",
+                unit="Seg",
+            ))
+        for aug_batch in futures:
+            aug_segs.extend(aug_batch)
+
+        segments = segments + aug_segs
+        labels   = labels   + [label] * len(aug_segs)
 
     return segments, labels
 
@@ -595,9 +650,9 @@ def extract_logmel(segment: np.ndarray) -> torch.Tensor:
     # MobileNetV3 erwartet 3-Kanal-Eingabe (wie ein RGB-Bild)
     x = x.repeat(3, 1, 1)
 
-    # Auf 224×224 interpolieren (bilinear = glatte Skalierung)
+    # Auf native Auflösung (IMG_H × IMG_W) skalieren: Frequenzachse = N_MELS, Zeitachse = ~63 Frames
     x = F.interpolate(
-        x.unsqueeze(0), size=(IMG_SIZE, IMG_SIZE), mode="bilinear", align_corners=False
+        x.unsqueeze(0), size=(IMG_H, IMG_W), mode="bilinear", align_corners=False
     ).squeeze(0)
 
     # ImageNet-Normierung: (Pixel - Mittelwert) / Standardabweichung, pro Kanal
@@ -662,7 +717,7 @@ class DroneDataset(Dataset):
     """
 
     def __init__(self, spec_tensors: List[torch.Tensor], labels: List[int], augment: bool = False):
-        self.specs   = spec_tensors  # Vorberechnete [3, IMG_SIZE, IMG_SIZE] Tensoren
+        self.specs   = spec_tensors  # Vorberechnete [3, IMG_H, IMG_W] Tensoren
         self.labels  = labels
         self.augment = augment
 
@@ -684,36 +739,47 @@ class DroneDataset(Dataset):
 
 class DroneClassifier(nn.Module):
     """
-    MobileNetV3-Small als Basis-Netz, mit angepasstem Klassifikationskopf.
+    EfficientNet-B0 als Basis-Netz, vortrainiert auf ImageNet via timm.
 
-    Transfer Learning: Das Netz wurde auf ImageNet (1.2 Mio. Fotos, 1000 Klassen)
-    vortrainiert. Es hat dabei gelernt, allgemeine visuelle Muster zu erkennen
-    (Kanten, Texturen, Formen). Diese Fähigkeit übertragen wir auf Spektrogramme.
+    Warum EfficientNet-B0 statt MobileNetV3-Small?
+    - Bessere Genauigkeit bei ähnlicher Modellgröße (compound scaling)
+    - timm bietet eine einheitliche API für viele Architekturen
+    - Einfacher später auf AudioSet-vortrainierte Varianten zu wechseln
 
-    Wir ersetzen nur den letzten Teil (den "Kopf") für unsere 2-Klassen-Aufgabe.
+    Hinweis zu AudioSet-Pretraining:
+    Für noch bessere Ergebnisse könnten PANNs (Pretrained Audio Neural Networks,
+    Kong et al. 2020) verwendet werden — ein CNN14 vortrainiert auf AudioSet.
+    Das würde bedeuten, dass das Netz Audiocharakteristika bereits "kennt"
+    statt nur visuelle ImageNet-Muster. PANNs erfordern allerdings einen
+    separaten Download der Gewichte von zenodo.org.
     """
 
     def __init__(self):
         super().__init__()
-        # Vortrainiertes Modell laden (lädt Gewichte automatisch herunter)
-        weights = MobileNet_V3_Small_Weights.DEFAULT
-        self.backbone = mobilenet_v3_small(weights=weights)
+        # EfficientNet-B0 laden: num_classes=0 liefert den reinen Feature-Extraktor
+        # ohne den originalen 1000-Klassen-Kopf.
+        # drop_rate: Dropout innerhalb des EfficientNet-Backbones
+        self.backbone = timm.create_model(
+            "efficientnet_b0",
+            pretrained=True,
+            num_classes=0,   # kein Klassifikationskopf, nur Features
+            drop_rate=0.2,
+        )
+        # Anzahl der Output-Features (1280 für EfficientNet-B0)
+        n_features = self.backbone.num_features
 
-        # Originalen Klassifikationskopf (für 1000 ImageNet-Klassen) ersetzen
-        # durch einen neuen Kopf für 2 Klassen (Drohne / keine Drohne)
-        in_features = self.backbone.classifier[0].in_features
-        self.backbone.classifier = nn.Sequential(
-            nn.Linear(in_features, 256),  # Vollverbundene Schicht: in_features → 256
-            nn.Hardswish(),               # Aktivierungsfunktion (glatte ReLU-Variante)
-            nn.Dropout(p=0.2, inplace=True),  # Dropout: 20% der Neuronen werden zufällig
-                                               # deaktiviert → reduziert Überanpassung
-            nn.Linear(256, 1),            # Ausgabe: ein Wert (Logit für "Drohne")
+        # Eigener Klassifikationskopf für unsere binäre Aufgabe
+        self.classifier = nn.Sequential(
+            nn.Linear(n_features, 256),
+            nn.SiLU(),          # Swish-Aktivierung — passt gut zu EfficientNet
+            nn.Dropout(p=0.3),
+            nn.Linear(256, 1),  # ein Ausgabewert = Logit für "Drohne"
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Vorwärtsdurchlauf: Eingabe → Logit (kein Sigmoid hier, das macht BCEWithLogitsLoss)"""
-        x = self.backbone(x)
-        return x.squeeze(-1)  # [batch, 1] → [batch]
+        """Vorwärtsdurchlauf: Eingabe → Logit (kein Sigmoid, das macht BCEWithLogitsLoss)"""
+        features = self.backbone(x)          # [batch, 1280]
+        return self.classifier(features).squeeze(-1)  # [batch]
 
 
 # ============================================================
@@ -722,36 +788,45 @@ class DroneClassifier(nn.Module):
 
 def freeze_backbone(model: DroneClassifier) -> None:
     """
-    Friert alle Feature-Extraktions-Schichten ein (keine Gewichtsänderung).
-    Nur der Klassifikationskopf wird trainiert.
+    Friert alle EfficientNet-Backbone-Schichten ein.
+    Nur der eigene Klassifikationskopf wird trainiert.
 
     Warum: In Phase 1 wollen wir nur den neuen Kopf anpassen, bevor wir
     das gesamte Netz feinjustieren. Sonst würden die vortrainierten Gewichte
-    zu schnell zerstört.
+    zu früh überschrieben.
     """
-    for param in model.backbone.features.parameters():
+    for param in model.backbone.parameters():
         param.requires_grad = False
-    for param in model.backbone.classifier.parameters():
+    for param in model.classifier.parameters():
         param.requires_grad = True
 
 
 def unfreeze_last_blocks(model: DroneClassifier, num_blocks: int = 4) -> None:
     """
-    Gibt die letzten 'num_blocks' Feature-Blöcke zum Training frei.
+    Gibt die letzten 'num_blocks' MBConv-Blöcke von EfficientNet-B0 frei.
 
-    In Phase 2 (Fine-Tuning) erlauben wir dem Netz, die letzten
-    MobileNet-Blöcke an unsere Domäne (Spektrogramme) anzupassen.
-    Die frühen Blöcke (einfache Kanten/Texturen) bleiben eingefroren.
+    EfficientNet-B0 hat 7 MBConv-Blöcke (blocks[0]–blocks[6]) plus
+    einen finalen Konvolutions-Block (conv_head). Wir geben die letzten
+    num_blocks Blöcke + conv_head frei, frühe Schichten bleiben eingefroren.
     """
     # Erst alles einfrieren
-    for param in model.backbone.features.parameters():
+    for param in model.backbone.parameters():
         param.requires_grad = False
-    # Dann die letzten num_blocks Blöcke freigeben
-    for block in list(model.backbone.features.children())[-num_blocks:]:
+
+    # Letzte num_blocks MBConv-Blöcke freigeben
+    all_blocks = list(model.backbone.blocks)
+    for block in all_blocks[-num_blocks:]:
         for param in block.parameters():
             param.requires_grad = True
-    # Klassifikationskopf bleibt immer trainierbar
-    for param in model.backbone.classifier.parameters():
+
+    # Finaler Conv-Block und BatchNorm immer freigeben
+    for param in model.backbone.conv_head.parameters():
+        param.requires_grad = True
+    for param in model.backbone.bn2.parameters():
+        param.requires_grad = True
+
+    # Klassifikationskopf immer trainierbar
+    for param in model.classifier.parameters():
         param.requires_grad = True
 
 
@@ -1079,11 +1154,13 @@ def train_model(return_outputs=False):
     # Trainingsparameter (LR, Epochen, Batch-Size) sind bewusst NICHT enthalten —
     # sie beeinflussen die Daten nicht, nur das Training.
     seg_cache_params = dict(
+        aug_ver=3,  # v3: fftconvolve statt np.convolve + parallele Augmentierung
         harm=HARM_THRESHOLD, seg=SEG_LEN_SEC, seed=SEED, sr=SAMPLE_RATE,
         naug=8,  # num_augment — muss mit dem Wert im load_segments-Aufruf übereinstimmen
         rir=round(P_APPLY_RIR, 3), echo=round(P_APPLY_ECHO, 3),
         noise=round(P_APPLY_NOISE, 3), pitch=round(P_PITCH_SHIFT, 3),
         stretch=round(P_TIME_STRETCH, 3),
+        dist=round(P_DISTANCE_ATT, 3), maxdist=int(MAX_DISTANCE_M),
     )
     seg_cache_path = _cache_key("segments", **seg_cache_params)
 
@@ -1166,7 +1243,7 @@ def train_model(return_outputs=False):
     # berechnet und als Tensoren gespeichert. Das Dataset lädt dann beim
     # Training nur noch fertige Tensoren — kein librosa mehr pro Epoche.
     # ----------------------------------------------------------
-    spec_cache_params = dict(**seg_cache_params, img=IMG_SIZE, nmels=N_MELS, hop=HOP_LENGTH)
+    spec_cache_params = dict(**seg_cache_params, imgh=IMG_H, imgw=IMG_W, nmels=N_MELS, hop=HOP_LENGTH)
     train_spec_cache = _cache_key("train_specs", **spec_cache_params)
     val_spec_cache   = _cache_key("val_specs",   **spec_cache_params)
 
@@ -1203,8 +1280,11 @@ def train_model(return_outputs=False):
 
     val_dataset = DroneDataset(val_specs, list(val_labels), augment=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler, num_workers=0)
-    val_loader   = DataLoader(val_dataset,   batch_size=16, shuffle=False,   num_workers=0)
+    # num_workers=0: Auf Windows würden Worker-Prozesse das gesamte Dataset (30+ GB)
+    # dreifach in den RAM kopieren → OOM-Absturz. Da die Tensoren bereits vorberechnet
+    # sind, ist num_workers=0 ausreichend schnell.
+    train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=0)
+    val_loader   = DataLoader(val_dataset,   batch_size=32, shuffle=False,   num_workers=0)
 
     # ----------------------------------------------------------
     # SCHRITT 5: MODELL INITIALISIEREN
@@ -1361,12 +1441,15 @@ def train_model(return_outputs=False):
         filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3
     )
     # CosineAnnealingLR: LR fällt nach einem Kosinus von lr=1e-3 auf eta_min=1e-5
-    # Das verhindert zu große Schritte gegen Ende des Trainings.
+    # Das verhindert zu große Schritte gegen Ende des Trainings.+
     scheduler1  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer1, T_max=8, eta_min=1e-5)
 
     best_balacc, best_state, patience_counter = run_epochs(
         optimizer1, epochs=8, phase_name="Phase1", scheduler=scheduler1
     )
+    if best_state is not None:
+        torch.save(best_state, "best_model_phase1.pt")
+        print(f"  → Modell Phase 1 gespeichert (BalAcc={best_balacc:.4f})")
 
     # ----------------------------------------------------------
     # PHASE 2: FINE-TUNING DER LETZTEN FEATURE-BLÖCKE
@@ -1376,14 +1459,17 @@ def train_model(return_outputs=False):
     unfreeze_last_blocks(model, num_blocks=4)
 
     optimizer2 = torch.optim.Adam([
-        {"params": model.backbone.features.parameters(),   "lr": 5e-6},
-        {"params": model.backbone.classifier.parameters(), "lr": 5e-5},
+        {"params": filter(lambda p: p.requires_grad, model.backbone.parameters()), "lr": 5e-6},
+        {"params": model.classifier.parameters(), "lr": 5e-5},
     ])
     scheduler2 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer2, T_max=15, eta_min=1e-7)
 
     best_balacc, best_state, patience_counter = run_epochs(
         optimizer2, epochs=15, phase_name="Phase2", scheduler=scheduler2
     )
+    if best_state is not None:
+        torch.save(best_state, "best_model_phase2.pt")
+        print(f"  → Modell Phase 2 gespeichert (BalAcc={best_balacc:.4f})")
 
     # ----------------------------------------------------------
     # PHASE 3: VOLLSTÄNDIGES FINE-TUNING ALLER SCHICHTEN
@@ -1396,14 +1482,17 @@ def train_model(return_outputs=False):
         param.requires_grad = True
 
     optimizer3 = torch.optim.Adam([
-        {"params": model.backbone.features.parameters(),   "lr": 1e-6},
-        {"params": model.backbone.classifier.parameters(), "lr": 1e-5},
+        {"params": model.backbone.parameters(), "lr": 1e-6},
+        {"params": model.classifier.parameters(), "lr": 1e-5},
     ])
     scheduler3 = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer3, T_max=10, eta_min=1e-8)
 
     best_balacc, best_state, patience_counter = run_epochs(
         optimizer3, epochs=10, phase_name="Phase3", scheduler=scheduler3
     )
+    if best_state is not None:
+        torch.save(best_state, "best_model_phase3.pt")
+        print(f"  → Modell Phase 3 gespeichert (BalAcc={best_balacc:.4f})")
 
     # Bestes Modell wiederherstellen
     if best_state is not None:
@@ -1475,7 +1564,7 @@ def train_model(return_outputs=False):
     plot_probability_distribution(preclass_labels, preclass_probs, suffix="pre_classified")
 
     # Modell exportieren
-    export_to_tflite(model, device, input_shape=(1, 3, IMG_SIZE, IMG_SIZE))
+    export_to_tflite(model, device, input_shape=(1, 3, IMG_H, IMG_W))
 
     print("\nTraining abgeschlossen.")
     print(f"Beste balanced Accuracy: {best_balacc:.4f}")
